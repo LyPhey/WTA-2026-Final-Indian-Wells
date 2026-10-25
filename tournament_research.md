@@ -25,3 +25,14 @@ Linda Noskova	            1,982.0
 Elina Svitolina	            1,966.2
 Karolina Muchova	        1,935.7
 
+Propose Machine Learning framework:
+Instead of one giant model that tries to pedict everything, recommend a layered system.
+
+Pre-match player features:
+- Elo
+- recent form
+- serve/return performance
+- surface,
+- fatigue
+- head-to-head
+
