@@ -36,3 +36,12 @@ Pre-match player features:
 - fatigue
 - head-to-head
 
+# Structure of the machine learning framework
+Pre-match player features: Elo, recent form, serve/return performance, surface, fatigue and head-to-head
+
+Elo + Logistic Regression:Interpretatble baseline for match-winner probabilities
+XGBoost / CatBoost : Captures nonlinear interactions between player statistics
+
+# Calibrated win and set probabilities
+Set-level model or scoreline simulation with consistent probabilities 
+
