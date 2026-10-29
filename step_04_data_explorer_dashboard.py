@@ -6,10 +6,15 @@ Run from this project directory:
 
 from __future__ import annotations
 
+from datetime import date
+import re
+import unicodedata
 from typing import Iterable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 
 from environmental_data_pipeline import (
@@ -69,6 +74,150 @@ SERVE_STAT_COLUMNS = [
 QUALITY_COLUMNS = list(dict.fromkeys(KEY_COLUMNS + SERVE_STAT_COLUMNS))
 PROVIDER_TIE_BREAK = {"TennisMyLife": 1, "Sackmann": 0}
 INCOMPLETE_SCORE_PATTERN = r"\b(?:RET|W/O|WALKOVER|DEF|ABN|ABD)\b"
+WTA_API_BASE = "https://api.wtatennis.com"
+WTA_PHOTO_QUERY_LIMIT = 20
+WTA_RESOURCE_VERSION = "v7.53.16"
+HAND_LABELS = {"R": "Right-handed", "L": "Left-handed"}
+
+
+def normalized_player_name(name: str) -> str:
+    """Normalize a name before matching it to an official WTA player record."""
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", " ", ascii_name.lower()).strip()
+
+
+def resized_wta_photo_url(url: str, *, width: int = 260, height: int = 347) -> str:
+    """Request a display-sized derivative from WTA's official photo service."""
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update({"width": str(width), "height": str(height)})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def wta_flag_url(country_code: str) -> str | None:
+    """Return the WTA-hosted flag asset for a three-letter country code."""
+    code = country_code.upper().strip()
+    if not re.fullmatch(r"[A-Z]{3}", code):
+        return None
+    return (
+        "https://www.wtatennis.com/"
+        f"resources/{WTA_RESOURCE_VERSION}/i/elements/flags/{code.lower()}.svg"
+    )
+
+
+def age_from_date_of_birth(date_of_birth: str | None) -> int | None:
+    """Return a player's current age from WTA's ISO date-of-birth value."""
+    if not date_of_birth:
+        return None
+    try:
+        birthday = date.fromisoformat(date_of_birth)
+    except ValueError:
+        return None
+    today = date.today()
+    return today.year - birthday.year - ((today.month, today.day) < (birthday.month, birthday.day))
+
+
+def normalized_hand(value: object) -> str | None:
+    """Normalize WTA's descriptive and raw-provider hand values to R or L."""
+    text = str(value).strip().upper()
+    if text in {"R", "RIGHT", "RIGHT-HANDED"} or text.startswith("RIGHT"):
+        return "R"
+    if text in {"L", "LEFT", "LEFT-HANDED"} or text.startswith("LEFT"):
+        return "L"
+    return None
+
+
+def hand_label(hand: str | None) -> str:
+    """Return a reader-friendly label for a normalized hand value."""
+    return HAND_LABELS.get(hand or "", "Not available")
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def get_wta_player_portrait(player_name: str) -> dict[str, str] | None:
+    """Find the current official WTA portrait for an exact player-name match.
+
+    The source datasets' player IDs are not WTA profile IDs, so this deliberately
+    resolves the name through WTA first. Results are cached for one day to avoid
+    a network request for each Streamlit rerun. No image is saved locally.
+    """
+    try:
+        player_response = requests.get(
+            f"{WTA_API_BASE}/tennis/players",
+            params={"name": player_name},
+            timeout=10,
+        )
+        player_response.raise_for_status()
+        candidates = player_response.json().get("content", [])
+    except (requests.RequestException, ValueError, AttributeError):
+        return None
+
+    expected_name = normalized_player_name(player_name)
+    exact_matches = [
+        candidate
+        for candidate in candidates
+        if normalized_player_name(str(candidate.get("fullName", ""))) == expected_name
+    ]
+    if len(exact_matches) != 1:
+        return None
+
+    wta_player = exact_matches[0]
+    player_id = wta_player.get("id")
+    if player_id is None:
+        return None
+
+    try:
+        detail_response = requests.get(
+            f"{WTA_API_BASE}/tennis/players/{player_id}/detailed",
+            timeout=10,
+        )
+        detail_response.raise_for_status()
+        wta_bio = detail_response.json().get("bio", {})
+    except (requests.RequestException, ValueError, AttributeError):
+        wta_bio = {}
+
+    try:
+        photo_response = requests.get(
+            f"{WTA_API_BASE}/content/wta/PHOTO/en",
+            params={
+                "limit": WTA_PHOTO_QUERY_LIMIT,
+                "tagNames": "player-headshot",
+                "referenceExpression": f"TENNIS_PLAYER:{player_id}",
+            },
+            timeout=10,
+        )
+        photo_response.raise_for_status()
+        photos = photo_response.json().get("content", [])
+    except (requests.RequestException, ValueError, AttributeError):
+        photos = []
+
+    def has_tag(photo: dict, label: str) -> bool:
+        return any(tag.get("label") == label for tag in photo.get("tags", []))
+
+    # Prefer a close crop, then use a full-body headshot when that is all WTA has.
+    portrait = next(
+        (photo for photo in photos if has_tag(photo, "head-cropped-photo")),
+        next((photo for photo in photos if has_tag(photo, "full-body-headshot")), None),
+    )
+    image_url = portrait.get("onDemandUrl") if portrait else None
+
+    profile_slug = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        unicodedata.normalize("NFKD", str(wta_player.get("fullName", player_name)))
+        .encode("ascii", "ignore")
+        .decode()
+        .lower(),
+    ).strip("-")
+    result = {
+        "player_id": str(player_id),
+        "profile_url": f"https://www.wtatennis.com/players/{player_id}/{profile_slug}",
+        "country_code": str(wta_player.get("countryCode", "")).upper(),
+        "date_of_birth": str(wta_player.get("dateOfBirth", "")),
+        "playing_hand": str(wta_bio.get("playhand", "")),
+    }
+    if image_url:
+        result["image_url"] = resized_wta_photo_url(image_url)
+    return result
 
 
 def normalized_identity_part(series: pd.Series) -> pd.Series:
@@ -849,6 +998,27 @@ def player_match_log(frame: pd.DataFrame, player: str) -> pd.DataFrame:
     log["opponent_rank"] = pd.to_numeric(
         matches["loser_rank"].where(won, matches["winner_rank"]), errors="coerce"
     )
+    log["player_age"] = pd.to_numeric(
+        matches["winner_age"].where(won, matches["loser_age"]), errors="coerce"
+    )
+    log["player_hand"] = matches["winner_hand"].where(won, matches["loser_hand"])
+    log["opponent_hand"] = matches["loser_hand"].where(won, matches["winner_hand"])
+    log["player_hand"] = log["player_hand"].map(normalized_hand)
+    log["opponent_hand"] = log["opponent_hand"].map(normalized_hand)
+    known_hands = log["player_hand"].notna() & log["opponent_hand"].notna()
+    log["hand_matchup"] = pd.Series("Hand unavailable", index=log.index)
+    log.loc[known_hands & log["player_hand"].eq(log["opponent_hand"]), "hand_matchup"] = (
+        "Same-handed opponent"
+    )
+    log.loc[known_hands & log["player_hand"].ne(log["opponent_hand"]), "hand_matchup"] = (
+        "Opposite-handed opponent"
+    )
+    # The source files do not identify confirmed injuries. A RET loss is the
+    # closest player-specific observable, so it is retained as an explicit proxy.
+    log["player_retired"] = (
+        log["result"].eq("Loss")
+        & matches["score_normalized"].str.contains(r"\bRET\b", regex=True, na=False)
+    )
 
     service_fields = {
         "aces": "ace",
@@ -885,15 +1055,243 @@ def draw_player_study(frame: pd.DataFrame, player: str) -> None:
         st.info("No matches for this player match the current filters.")
         return
 
-    st.subheader(f"Player study: {player}")
+    portrait = get_wta_player_portrait(player)
+    official_age = age_from_date_of_birth(
+        portrait.get("date_of_birth") if portrait else None
+    )
+    recorded_ages = log.dropna(subset=["match_date", "player_age"]).sort_values("match_date")
+    latest_recorded_age = (
+        recorded_ages.iloc[-1]["player_age"] if not recorded_ages.empty else pd.NA
+    )
+    age_value = (
+        f"{official_age} years"
+        if official_age is not None
+        else (
+            f"{latest_recorded_age:.1f} years"
+            if pd.notna(latest_recorded_age)
+            else "N/A"
+        )
+    )
+    age_help = (
+        "Current age from the official WTA date of birth."
+        if official_age is not None
+        else "Age from the player's most recent match record in the selected data."
+    )
+    country_code = portrait.get("country_code", "") if portrait else ""
+    flag_url = wta_flag_url(country_code) if country_code else None
+    official_hand = normalized_hand(portrait.get("playing_hand", "") if portrait else "")
+    detected_hands = log["player_hand"].dropna()
+    source_hand = detected_hands.mode().iloc[0] if not detected_hands.empty else None
+    player_hand = official_hand or source_hand
+    player_retirements = int(log["player_retired"].sum())
+    retirement_rate = pct(player_retirements, len(log))
+    matchup_order = ["Same-handed opponent", "Opposite-handed opponent"]
+    hand_matchups = log[log["hand_matchup"].isin(matchup_order)]
+    hand_summary = (
+        hand_matchups.groupby("hand_matchup", as_index=False)
+        .agg(
+            matches=("result", "size"),
+            wins=("result", lambda results: (results == "Win").sum()),
+        )
+        .set_index("hand_matchup")
+        .reindex(matchup_order, fill_value=0)
+        .rename_axis("hand_matchup")
+        .reset_index()
+    )
+    hand_summary["losses"] = hand_summary["matches"] - hand_summary["wins"]
+    hand_summary["win_rate_pct"] = (
+        100 * hand_summary["wins"] / hand_summary["matches"].replace(0, pd.NA)
+    )
+
+    def hand_matchup_metric(matchup: str) -> tuple[str, str]:
+        row = hand_summary.loc[hand_summary["hand_matchup"].eq(matchup)].iloc[0]
+        if not row["matches"]:
+            return "N/A", "No matches with both hands recorded"
+        return f"{row['win_rate_pct']:.1f}%", f"{int(row['wins'])}-{int(row['losses'])} ({int(row['matches'])} matches)"
+
+    image_column, flag_column, title_column = st.columns([1, 0.95, 3.05])
+    with image_column:
+        if portrait and portrait.get("image_url"):
+            st.image(
+                portrait["image_url"],
+                caption="Official WTA portrait",
+                width="stretch",
+            )
+        else:
+            st.info("Official WTA portrait unavailable for this player.")
+    with flag_column:
+        if flag_url:
+            st.image(flag_url, width="stretch")
+            st.caption(f"Represents {country_code}")
+    with title_column:
+        st.subheader(f"Player study: {player}")
+        if portrait:
+            st.link_button("Open official WTA profile ↗", portrait["profile_url"])
+        st.caption(
+            "Portrait, represented-country flag, date of birth, and playing hand are fetched from "
+            "WTA’s official service and cached for one day; no image files are stored locally."
+        )
+
     wins = int(log["result"].eq("Win").sum())
     completed = log["match_status"].eq("Completed")
-    metrics = st.columns(5)
-    metrics[0].metric("Combined matches", f"{len(log):,}")
-    metrics[1].metric("Record", f"{wins}-{len(log) - wins}")
-    metrics[2].metric("Win rate", f"{wins / len(log) * 100:.1f}%")
-    metrics[3].metric("Completed matches", f"{completed.mean() * 100:.1f}%")
-    metrics[4].metric("Serve stats available", f"{log['serve_points'].notna().mean() * 100:.1f}%")
+    metrics = st.columns(6)
+    metrics[0].metric("Age", age_value, help=age_help)
+    metrics[1].metric("Combined matches", f"{len(log):,}")
+    metrics[2].metric("Record", f"{wins}-{len(log) - wins}")
+    metrics[3].metric("Win rate", f"{wins / len(log) * 100:.1f}%")
+    metrics[4].metric("Completed matches", f"{completed.mean() * 100:.1f}%")
+    metrics[5].metric(
+        "Injury / retirement rate†",
+        f"{retirement_rate:.1f}%",
+        delta=f"{player_retirements} player retirement(s)",
+        delta_color="off",
+        help=(
+            "The source files do not record confirmed injuries. This is the share of selected "
+            "matches the player lost with RET in the score, which is an injury/illness proxy."
+        ),
+    )
+    st.caption(
+        "† The data does not identify confirmed injuries. A player retirement (RET) is used as "
+        "an injury/illness proxy; opponent retirements are excluded."
+    )
+
+    st.markdown("#### Playing hand and opponent matchup")
+    hand_metrics = st.columns(4)
+    hand_metrics[0].metric(
+        "Playing hand",
+        hand_label(player_hand),
+        help=(
+            "Official WTA profile value when available; otherwise the most frequent hand value "
+            "in the selected match records."
+        ),
+    )
+    same_value, same_detail = hand_matchup_metric("Same-handed opponent")
+    opposite_value, opposite_detail = hand_matchup_metric("Opposite-handed opponent")
+    hand_metrics[1].metric(
+        "Win rate vs same-handed",
+        same_value,
+        delta=same_detail,
+        delta_color="off",
+    )
+    hand_metrics[2].metric(
+        "Win rate vs opposite-handed",
+        opposite_value,
+        delta=opposite_detail,
+        delta_color="off",
+    )
+    hand_metrics[3].metric(
+        "Hand data coverage",
+        f"{pct(len(hand_matchups), len(log)):.1f}%",
+        delta=f"{len(hand_matchups):,} of {len(log):,} matches",
+        delta_color="off",
+        help="A comparison needs a recorded hand for both the player and opponent.",
+    )
+    st.plotly_chart(
+        px.bar(
+            hand_summary.dropna(subset=["win_rate_pct"]),
+            x="hand_matchup",
+            y="win_rate_pct",
+            text="matches",
+            color="hand_matchup",
+            category_orders={"hand_matchup": matchup_order},
+            labels={
+                "hand_matchup": "Opponent hand matchup",
+                "win_rate_pct": "Win rate (%)",
+                "matches": "Matches",
+            },
+            title="Win rate by opponent hitting hand (label = matches)",
+        ).update_yaxes(ticksuffix="%", range=[0, 100]),
+        width="stretch",
+    )
+
+    st.markdown("#### Per-match averages")
+    average_minutes = log["minutes"].mean()
+    average_aces = log["aces"].mean()
+    average_double_faults = log["double_faults"].mean()
+    average_first_serve_won = log["first_serve_won_pct"].mean()
+    average_second_serve_won = log["second_serve_won_pct"].mean()
+    average_temperature = log["weather_temperature_mean_f"].mean()
+    average_metrics_top = st.columns(3)
+    average_metrics_top[0].metric(
+        "Average match duration",
+        "N/A" if pd.isna(average_minutes) else f"{average_minutes:.1f} min",
+    )
+    average_metrics_top[1].metric(
+        "Average aces", "N/A" if pd.isna(average_aces) else f"{average_aces:.1f}"
+    )
+    average_metrics_top[2].metric(
+        "Average double faults",
+        "N/A" if pd.isna(average_double_faults) else f"{average_double_faults:.1f}",
+    )
+    average_metrics_bottom = st.columns(3)
+    average_metrics_bottom[0].metric(
+        "Average 1st serve won",
+        "N/A" if pd.isna(average_first_serve_won) else f"{average_first_serve_won:.1f}%",
+    )
+    average_metrics_bottom[1].metric(
+        "Average 2nd serve won",
+        "N/A" if pd.isna(average_second_serve_won) else f"{average_second_serve_won:.1f}%",
+    )
+    average_metrics_bottom[2].metric(
+        "Average tournament-week temperature",
+        "N/A" if pd.isna(average_temperature) else f"{average_temperature:.1f} °F",
+    )
+
+    st.markdown("#### Detailed player-relative match log")
+    st.caption(
+        "One de-duplicated row per match. Weather values are tournament-week aggregates when a venue or city mapping is available."
+    )
+    detail_columns = [
+        "source_year",
+        "tourney_name",
+        "round",
+        "result",
+        "opponent",
+        "score",
+        "surface",
+        "player_rank",
+        "opponent_rank",
+        "player_age",
+        "player_hand",
+        "opponent_hand",
+        "hand_matchup",
+        "minutes",
+        "player_retired",
+        "aces",
+        "double_faults",
+        "first_serve_in_pct",
+        "first_serve_won_pct",
+        "second_serve_won_pct",
+        "weather_temperature_mean_f",
+        "weather_wind_speed_max_kmh",
+    ]
+    st.dataframe(
+        log[detail_columns]
+        .sort_values(["source_year", "tourney_name"], ascending=[False, True])
+        .rename(
+            columns={
+                "source_year": "Year",
+                "tourney_name": "Tournament",
+                "player_rank": "Player rank",
+                "opponent_rank": "Opponent rank",
+                "player_age": "Player age",
+                "player_hand": "Player hand",
+                "opponent_hand": "Opponent hand",
+                "hand_matchup": "Opponent hand matchup",
+                "player_retired": "Player retired (injury proxy)",
+                "double_faults": "Double faults",
+                "first_serve_in_pct": "1st serve in (%)",
+                "first_serve_won_pct": "1st serve won (%)",
+                "second_serve_won_pct": "2nd serve won (%)",
+                "weather_temperature_mean_f": "Week temperature (°F)",
+                "weather_wind_speed_max_kmh": "Week max wind (km/h)",
+            }
+        ),
+        hide_index=True,
+        width="stretch",
+        height=430,
+    )
+    st.divider()
 
     yearly = (
         log.groupby(["source_year", "result"], as_index=False)
@@ -935,33 +1333,30 @@ def draw_player_study(frame: pd.DataFrame, player: str) -> None:
         )
 
     ranking_log = log.dropna(subset=["match_date", "player_rank"])
-    service_by_year = (
+    match_averages_by_year = (
         log.groupby("source_year", as_index=False)
         .agg(
-            serve_points=("serve_points", "sum"),
-            first_serves_in=("first_serves_in", "sum"),
-            first_serve_points_won=("first_serve_points_won", "sum"),
-            second_serve_points_won=("second_serve_points_won", "sum"),
+            **{
+                "Average duration (min)": ("minutes", "mean"),
+                "Average aces": ("aces", "mean"),
+                "Average double faults": ("double_faults", "mean"),
+                "Average 1st serve won (%)": ("first_serve_won_pct", "mean"),
+                "Average 2nd serve won (%)": ("second_serve_won_pct", "mean"),
+                "Average temperature (°F)": ("weather_temperature_mean_f", "mean"),
+            }
         )
     )
-    service_by_year["second_serve_points"] = (
-        service_by_year["serve_points"] - service_by_year["first_serves_in"]
-    )
-    service_by_year["First serve won (%)"] = (
-        100
-        * service_by_year["first_serve_points_won"]
-        / service_by_year["first_serves_in"].replace(0, pd.NA)
-    )
-    service_by_year["Second serve won (%)"] = (
-        100
-        * service_by_year["second_serve_points_won"]
-        / service_by_year["second_serve_points"].replace(0, pd.NA)
-    )
-    service_trend = service_by_year.melt(
+    serve_trend = match_averages_by_year.melt(
         id_vars="source_year",
-        value_vars=["First serve won (%)", "Second serve won (%)"],
+        value_vars=["Average 1st serve won (%)", "Average 2nd serve won (%)"],
         var_name="Measure",
         value_name="Rate (%)",
+    )
+    workload_trend = match_averages_by_year.melt(
+        id_vars="source_year",
+        value_vars=["Average duration (min)", "Average aces", "Average double faults"],
+        var_name="Measure",
+        value_name="Average per match",
     )
     left, right = st.columns(2)
     with left:
@@ -980,58 +1375,43 @@ def draw_player_study(frame: pd.DataFrame, player: str) -> None:
     with right:
         st.plotly_chart(
             px.line(
-                service_trend,
+                serve_trend,
                 x="source_year",
                 y="Rate (%)",
                 color="Measure",
                 markers=True,
                 labels={"source_year": "Year"},
-                title="Seasonal serve-point win rates",
+                title="Average serve-point win rates by season",
             ).update_yaxes(ticksuffix="%", range=[0, 100]),
             width="stretch",
         )
 
-    detail_columns = [
-        "source_year",
-        "tourney_name",
-        "round",
-        "result",
-        "opponent",
-        "score",
-        "surface",
-        "player_rank",
-        "opponent_rank",
-        "minutes",
-        "aces",
-        "double_faults",
-        "first_serve_in_pct",
-        "first_serve_won_pct",
-        "second_serve_won_pct",
-        "weather_temperature_mean_f",
-        "weather_wind_speed_max_kmh",
-    ]
-    st.dataframe(
-        log[detail_columns]
-        .sort_values(["source_year", "tourney_name"], ascending=[False, True])
-        .rename(
-            columns={
-                "source_year": "Year",
-                "tourney_name": "Tournament",
-                "player_rank": "Player rank",
-                "opponent_rank": "Opponent rank",
-                "double_faults": "Double faults",
-                "first_serve_in_pct": "1st serve in (%)",
-                "first_serve_won_pct": "1st serve won (%)",
-                "second_serve_won_pct": "2nd serve won (%)",
-                "weather_temperature_mean_f": "Week temperature (°F)",
-                "weather_wind_speed_max_kmh": "Week max wind (km/h)",
-            }
-        ),
-        hide_index=True,
-        width="stretch",
-        height=430,
-    )
-
+    left, right = st.columns(2)
+    with left:
+        st.plotly_chart(
+            px.line(
+                workload_trend,
+                x="source_year",
+                y="Average per match",
+                facet_col="Measure",
+                markers=True,
+                labels={"source_year": "Year"},
+                title="Average duration, aces, and double faults by season",
+            ).update_yaxes(matches=None),
+            width="stretch",
+        )
+    with right:
+        st.plotly_chart(
+            px.line(
+                match_averages_by_year,
+                x="source_year",
+                y="Average temperature (°F)",
+                markers=True,
+                labels={"source_year": "Year"},
+                title="Average tournament-week temperature by season",
+            ).update_yaxes(ticksuffix=" °F"),
+            width="stretch",
+        )
 
 def draw_match_finder(frame: pd.DataFrame) -> None:
     st.subheader("Match finder")
