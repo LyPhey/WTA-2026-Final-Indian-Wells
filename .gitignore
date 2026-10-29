@@ -1,7 +1,6 @@
 /data/*
 !/data/reference/
 /data/reference/*
-!/data/reference/venue_reference.csv
 .vscode/
 .DS_Store
 __pycache__/
