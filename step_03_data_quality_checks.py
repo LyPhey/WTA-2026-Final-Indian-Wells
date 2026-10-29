@@ -35,6 +35,7 @@
 
 import pandas as pd
 
+from environmental_data_pipeline import enrich_matches_with_environment
 from step_02_load_and_compatre_providers import load_provider
 
 sackmann = load_provider('sackmann', 'wta_matches_*.csv')
@@ -51,6 +52,13 @@ KEY_COLUMNS = [
     "w_svpt",
     "l_svpt",
 ]
+ENVIRONMENT_COLUMNS = [
+    "venue_key",
+    "weather_status",
+    "weather_temperature_mean_f",
+    "weather_precipitation_total_mm",
+    "weather_wind_speed_max_kmh",
+]
 
 def quality_summary(df: pd.DataFrame, provider: str):
     dates = pd.to_datetime(
@@ -62,7 +70,7 @@ def quality_summary(df: pd.DataFrame, provider: str):
     scores = df['score'].fillna("").astype(str).str.strip().str.upper()
 
     non_completed = scores.str.contains(
-        r"\b(?:RET|W/0|WALKOVER|DEF|ABN|ABD)\b",
+        r"\b(?:RET|W/O|WALKOVER|DEF|ABN|ABD)\b",
         regex = True,
     )
 
@@ -102,11 +110,42 @@ def quality_summary(df: pd.DataFrame, provider: str):
     return summary, missingness
 
 
+def environmental_quality_summary(df: pd.DataFrame, provider: str):
+    """Report venue/weather coverage separately from raw source quality."""
+    venue_mapped = df["venue_match_status"].eq("matched")
+    weather_available = df["weather_status"].eq("ok")
+    summary = pd.DataFrame([{
+        "provider": provider,
+        "weather_grain": "tournament_week",
+        "venue_mapped_pct": round(venue_mapped.mean() * 100, 2),
+        "tournament_week_weather_available_pct": round(
+            weather_available.mean() * 100, 2
+        ),
+        "weather_rows_available": int(weather_available.sum()),
+        "weather_rows_missing": int((~weather_available).sum()),
+    }])
+    missingness = (
+        df[ENVIRONMENT_COLUMNS]
+        .isna()
+        .mean()
+        .mul(100)
+        .round(2)
+        .sort_values(ascending=False)
+        .rename("column")
+        .reset_index(name="missing_pct")
+    )
+    return summary, missingness
+
+
 for provider_name, frame in {
     "Sackmann": sackmann,
     "TennisMyLife": tennismylife,
 }.items():
     summary, missingness = quality_summary(frame, provider_name)
+    environmental_frame = enrich_matches_with_environment(frame)
+    environmental_summary, environmental_missingness = environmental_quality_summary(
+        environmental_frame, provider_name
+    )
 
     print(f"\n{'=' * 20} {provider_name} {'=' * 20}")
     print(summary.set_index('provider').T.to_string())
@@ -114,4 +153,9 @@ for provider_name, frame in {
     print("\nMissingness in key columns (%):")
     print(missingness.to_string(index=False))
 
-    
+    print("\nEnvironmental enrichment coverage:")
+    print(environmental_summary.set_index("provider").T.to_string())
+
+    print("\nMissingness in environmental fields (%):")
+    print(environmental_missingness.to_string(index=False))
+
