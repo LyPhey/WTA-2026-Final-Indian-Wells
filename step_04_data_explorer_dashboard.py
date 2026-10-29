@@ -7,6 +7,7 @@ Run from this project directory:
 from __future__ import annotations
 
 from datetime import date
+from io import BytesIO
 import re
 import unicodedata
 from typing import Iterable
@@ -14,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -78,10 +80,55 @@ WTA_API_BASE = "https://api.wtatennis.com"
 WTA_PHOTO_QUERY_LIMIT = 20
 WTA_RESOURCE_VERSION = "v7.53.16"
 HAND_LABELS = {"R": "Right-handed", "L": "Left-handed"}
+MCP_WTA_OVERVIEW_URL = (
+    "https://raw.githubusercontent.com/JeffSackmann/tennis_MatchChartingProject/"
+    "master/charting-w-stats-Overview.csv"
+)
+MCP_WTA_MATCHES_URL = (
+    "https://raw.githubusercontent.com/JeffSackmann/tennis_MatchChartingProject/"
+    "master/charting-w-matches.csv"
+)
+MCP_WTA_SHOT_DIRECTION_URL = (
+    "https://raw.githubusercontent.com/JeffSackmann/tennis_MatchChartingProject/"
+    "master/charting-w-stats-ShotDirection.csv"
+)
+MCP_SHOT_WINNER_COLUMNS = [
+    "match_id",
+    "source_year",
+    "tourney_key",
+    "player_key",
+    "opponent_key",
+    "winners_fh",
+    "winners_bh",
+]
+MCP_SHOT_DIRECTION_COLUMNS = [
+    "match_id",
+    "source_year",
+    "tourney_key",
+    "player_key",
+    "opponent_key",
+    "shot_type",
+    "crosscourt",
+    "down_middle",
+    "down_the_line",
+    "inside_out",
+    "inside_in",
+]
+COURT_DIRECTION_ZONES = {
+    "crosscourt": (-2.9, 18.3, "Crosscourt"),
+    "down_middle": (0.0, 18.5, "Down the middle"),
+    "down_the_line": (2.9, 18.3, "Down the line"),
+    "inside_out": (-2.5, 15.0, "Inside-out"),
+    "inside_in": (2.5, 15.0, "Inside-in"),
+}
 
 
-def normalized_player_name(name: str) -> str:
-    """Normalize a name before matching it to an official WTA player record."""
+def normalized_player_name(name: object) -> str:
+    """Normalize a label before matching it to an official WTA player record."""
+    if not isinstance(name, str):
+        if pd.isna(name):
+            return ""
+        name = str(name)
     ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
     return re.sub(r"[^a-z0-9]+", " ", ascii_name.lower()).strip()
 
@@ -130,6 +177,199 @@ def normalized_hand(value: object) -> str | None:
 def hand_label(hand: str | None) -> str:
     """Return a reader-friendly label for a normalized hand value."""
     return HAND_LABELS.get(hand or "", "Not available")
+
+
+def empty_mcp_shot_winner_frame() -> pd.DataFrame:
+    """Return an empty, schema-consistent charted-shot statistics frame."""
+    return pd.DataFrame(columns=MCP_SHOT_WINNER_COLUMNS)
+
+
+def empty_mcp_shot_direction_frame() -> pd.DataFrame:
+    """Return an empty, schema-consistent charted-shot-direction frame."""
+    return pd.DataFrame(columns=MCP_SHOT_DIRECTION_COLUMNS)
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def load_mcp_wta_shot_winner_stats() -> pd.DataFrame:
+    """Load forehand/backhand winners from the Match Charting Project.
+
+    This is a crowdsourced, charted-match sample rather than a complete WTA
+    results feed. Its CC BY-NC-SA 4.0 terms require attribution and
+    noncommercial use. Only Total match rows are retained.
+    """
+    try:
+        overview_response = requests.get(MCP_WTA_OVERVIEW_URL, timeout=30)
+        overview_response.raise_for_status()
+        matches_response = requests.get(MCP_WTA_MATCHES_URL, timeout=30)
+        matches_response.raise_for_status()
+        overview = pd.read_csv(BytesIO(overview_response.content))
+        charted_matches = pd.read_csv(BytesIO(matches_response.content))
+    except (requests.RequestException, pd.errors.ParserError, UnicodeDecodeError):
+        return empty_mcp_shot_winner_frame()
+
+    required_overview = {"match_id", "player", "set", "winners_fh", "winners_bh"}
+    required_matches = {"match_id", "Tournament"}
+    if not required_overview.issubset(overview) or not required_matches.issubset(
+        charted_matches
+    ):
+        return empty_mcp_shot_winner_frame()
+
+    shot_winners = overview.loc[overview["set"].eq("Total")].copy()
+    shot_winners["source_year"] = pd.to_numeric(
+        shot_winners["match_id"].astype(str).str[:4], errors="coerce"
+    ).astype("Int64")
+    shot_winners["player_key"] = shot_winners["player"].map(normalized_player_name)
+
+    players_per_match = shot_winners.groupby("match_id")["player"].agg(list)
+
+    def opponent_in_charted_match(row: pd.Series) -> str | None:
+        opponents = [
+            player for player in players_per_match[row["match_id"]] if player != row["player"]
+        ]
+        return opponents[0] if len(opponents) == 1 else None
+
+    shot_winners["opponent"] = shot_winners.apply(opponent_in_charted_match, axis=1)
+    shot_winners["opponent_key"] = shot_winners["opponent"].map(normalized_player_name)
+    tournament_names = (
+        charted_matches[["match_id", "Tournament"]]
+        .dropna(subset=["Tournament"])
+        .drop_duplicates("match_id")
+        .rename(columns={"Tournament": "mcp_tourney_name"})
+    )
+    shot_winners = shot_winners.merge(
+        tournament_names, on="match_id", how="left", validate="many_to_one"
+    )
+    shot_winners["tourney_key"] = shot_winners["mcp_tourney_name"].map(
+        normalized_player_name
+    )
+    shot_winners["winners_fh"] = pd.to_numeric(
+        shot_winners["winners_fh"], errors="coerce"
+    )
+    shot_winners["winners_bh"] = pd.to_numeric(
+        shot_winners["winners_bh"], errors="coerce"
+    )
+    shot_winners = shot_winners.loc[:, MCP_SHOT_WINNER_COLUMNS].dropna(
+        subset=["source_year", "tourney_key", "player_key", "opponent_key"]
+    )
+    return shot_winners.loc[
+        shot_winners[["tourney_key", "player_key", "opponent_key"]].ne("").all(axis=1)
+    ]
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def load_mcp_wta_shot_direction_stats() -> pd.DataFrame:
+    """Load charted shot-direction counts from the Match Charting Project."""
+    try:
+        direction_response = requests.get(MCP_WTA_SHOT_DIRECTION_URL, timeout=30)
+        direction_response.raise_for_status()
+        matches_response = requests.get(MCP_WTA_MATCHES_URL, timeout=30)
+        matches_response.raise_for_status()
+        directions = pd.read_csv(BytesIO(direction_response.content))
+        charted_matches = pd.read_csv(BytesIO(matches_response.content))
+    except (requests.RequestException, pd.errors.ParserError, UnicodeDecodeError):
+        return empty_mcp_shot_direction_frame()
+
+    direction_columns = set(MCP_SHOT_DIRECTION_COLUMNS) - {
+        "source_year",
+        "tourney_key",
+        "player_key",
+        "opponent_key",
+        "shot_type",
+    }
+    required_directions = direction_columns | {"player", "row"}
+    required_matches = {"match_id", "Tournament"}
+    if not required_directions.issubset(directions) or not required_matches.issubset(
+        charted_matches
+    ):
+        return empty_mcp_shot_direction_frame()
+
+    directions = directions.loc[directions["row"].isin(["Total", "F", "B"])].copy()
+    directions["source_year"] = pd.to_numeric(
+        directions["match_id"].astype(str).str[:4], errors="coerce"
+    ).astype("Int64")
+    directions["player_key"] = directions["player"].map(normalized_player_name)
+    directions["shot_type"] = directions["row"].map(
+        {"Total": "All charted shots", "F": "Forehand", "B": "Backhand"}
+    )
+
+    players_per_match = directions.groupby("match_id")["player"].agg(
+        lambda names: list(dict.fromkeys(names))
+    )
+
+    def opponent_in_charted_match(row: pd.Series) -> str | None:
+        opponents = [
+            player for player in players_per_match[row["match_id"]] if player != row["player"]
+        ]
+        return opponents[0] if len(opponents) == 1 else None
+
+    directions["opponent"] = directions.apply(opponent_in_charted_match, axis=1)
+    directions["opponent_key"] = directions["opponent"].map(normalized_player_name)
+    tournament_names = (
+        charted_matches[["match_id", "Tournament"]]
+        .dropna(subset=["Tournament"])
+        .drop_duplicates("match_id")
+        .rename(columns={"Tournament": "mcp_tourney_name"})
+    )
+    directions = directions.merge(
+        tournament_names, on="match_id", how="left", validate="many_to_one"
+    )
+    directions["tourney_key"] = directions["mcp_tourney_name"].map(
+        normalized_player_name
+    )
+    for column in direction_columns - {"match_id"}:
+        directions[column] = pd.to_numeric(directions[column], errors="coerce")
+    directions = directions.loc[:, MCP_SHOT_DIRECTION_COLUMNS].dropna(
+        subset=["source_year", "tourney_key", "player_key", "opponent_key", "shot_type"]
+    )
+    return directions.loc[
+        directions[["tourney_key", "player_key", "opponent_key"]].ne("").all(axis=1)
+    ]
+
+
+def matched_mcp_chart_rows(
+    log: pd.DataFrame, player: str, charted: pd.DataFrame
+) -> pd.DataFrame:
+    """Return only unambiguous charted matches from the filtered player log."""
+    if charted.empty:
+        return charted.copy()
+
+    join_columns = ["source_year", "tourney_key", "player_key", "opponent_key"]
+    source_keys = log[["source_year", "tourney_name", "opponent"]].copy()
+    source_keys["source_year"] = pd.to_numeric(
+        source_keys["source_year"], errors="coerce"
+    ).astype("Int64")
+    source_keys["tourney_key"] = source_keys.pop("tourney_name").map(
+        normalized_player_name
+    )
+    source_keys["player_key"] = normalized_player_name(player)
+    source_keys["opponent_key"] = source_keys.pop("opponent").map(
+        normalized_player_name
+    )
+
+    charted = charted.loc[
+        charted["player_key"].eq(normalized_player_name(player))
+    ].copy()
+    source_counts = source_keys.value_counts(join_columns)
+    charted_counts = charted.value_counts(join_columns)
+    unique_source_keys = source_counts.loc[source_counts.eq(1)].index
+    unique_charted_keys = charted_counts.loc[charted_counts.eq(1)].index
+    matching_keys = unique_source_keys.intersection(unique_charted_keys)
+    if matching_keys.empty:
+        return charted.iloc[0:0].copy()
+
+    return charted.set_index(join_columns).loc[
+        lambda indexed: indexed.index.isin(matching_keys)
+    ].reset_index()
+
+
+def matched_shot_winner_stats(log: pd.DataFrame, player: str) -> pd.DataFrame:
+    """Return matched charted forehand/backhand-winner totals."""
+    return matched_mcp_chart_rows(log, player, load_mcp_wta_shot_winner_stats())
+
+
+def matched_shot_direction_stats(log: pd.DataFrame, player: str) -> pd.DataFrame:
+    """Return matched charted groundstroke-direction totals."""
+    return matched_mcp_chart_rows(log, player, load_mcp_wta_shot_direction_stats())
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
@@ -1049,6 +1289,210 @@ def player_match_log(frame: pd.DataFrame, player: str) -> pd.DataFrame:
     return log
 
 
+def draw_shot_winner_summary(log: pd.DataFrame, player: str) -> None:
+    """Render forehand/backhand winner averages for matched charted matches."""
+    st.markdown("#### Charted forehand and backhand winners")
+    shot_winners = matched_shot_winner_stats(log, player)
+    if shot_winners.empty:
+        st.info(
+            "No uniquely matched shot-charted WTA matches are available for this player under "
+            "the current filters. This does not mean the player recorded no winners."
+        )
+        return
+
+    shot_winners["groundstroke_winners"] = (
+        shot_winners["winners_fh"] + shot_winners["winners_bh"]
+    )
+    average_forehand = shot_winners["winners_fh"].mean()
+    average_backhand = shot_winners["winners_bh"].mean()
+    average_groundstroke = shot_winners["groundstroke_winners"].mean()
+    metrics = st.columns(4)
+    metrics[0].metric("Charted matches", f"{len(shot_winners):,}")
+    metrics[1].metric("Average forehand winners", f"{average_forehand:.1f} / match")
+    metrics[2].metric("Average backhand winners", f"{average_backhand:.1f} / match")
+    metrics[3].metric(
+        "Average FH + BH winners", f"{average_groundstroke:.1f} / match"
+    )
+
+    winner_averages = pd.DataFrame(
+        {
+            "Shot": ["Forehand", "Backhand", "Forehand + backhand"],
+            "Average winners per match": [
+                average_forehand,
+                average_backhand,
+                average_groundstroke,
+            ],
+            "Charted matches": [len(shot_winners)] * 3,
+        }
+    )
+    st.plotly_chart(
+        px.bar(
+            winner_averages,
+            x="Shot",
+            y="Average winners per match",
+            text="Average winners per match",
+            color="Shot",
+            labels={"Average winners per match": "Average winners / match"},
+            title="Average shot-classified winners per matched match",
+        ).update_traces(texttemplate="%{text:.1f}", textposition="outside"),
+        width="stretch",
+    )
+    st.caption(
+        "These figures come from the crowdsourced Tennis Abstract Match Charting Project, "
+        "not Sackmann or TennisMyLife. Only a unique match on player, opponent, tournament, "
+        "and year is included, so the sample is intentionally smaller than the full match log. "
+        "Source: https://github.com/JeffSackmann/tennis_MatchChartingProject "
+        "(CC BY-NC-SA 4.0; noncommercial use with attribution)."
+    )
+
+
+def court_coverage_figure(direction_totals: pd.Series, shot_type: str) -> go.Figure:
+    """Create a court-style view of categorical shot-direction totals.
+
+    The Match Charting Project records shot directions, not ball-tracking x/y
+    coordinates. The zone positions below are intentionally illustrative.
+    """
+    fig = go.Figure()
+    doubles_half_width = 5.485
+    singles_half_width = 4.115
+    court_length = 23.77
+    net_y = court_length / 2
+    service_line_y = 5.485
+    opponent_service_line_y = court_length - service_line_y
+    line_style = {"color": "#E6E1EE", "width": 2}
+
+    fig.add_shape(
+        type="rect",
+        x0=-doubles_half_width,
+        x1=doubles_half_width,
+        y0=0,
+        y1=court_length,
+        fillcolor="#42386F",
+        line=line_style,
+        layer="below",
+    )
+    for x in (-singles_half_width, singles_half_width):
+        fig.add_shape(type="line", x0=x, x1=x, y0=0, y1=court_length, line=line_style)
+    for y in (service_line_y, opponent_service_line_y):
+        fig.add_shape(
+            type="line",
+            x0=-singles_half_width,
+            x1=singles_half_width,
+            y0=y,
+            y1=y,
+            line=line_style,
+        )
+    fig.add_shape(
+        type="line",
+        x0=0,
+        x1=0,
+        y0=service_line_y,
+        y1=opponent_service_line_y,
+        line=line_style,
+    )
+    fig.add_shape(
+        type="line",
+        x0=-doubles_half_width - 0.2,
+        x1=doubles_half_width + 0.2,
+        y0=net_y,
+        y1=net_y,
+        line={"color": "#16131E", "width": 7},
+    )
+
+    zones = []
+    for direction, (x, y, label) in COURT_DIRECTION_ZONES.items():
+        count = int(direction_totals.get(direction, 0))
+        zones.append({"x": x, "y": y, "label": label, "count": count})
+    zone_frame = pd.DataFrame(zones)
+    maximum = max(zone_frame["count"].max(), 1)
+    marker_size = 24 + 76 * (zone_frame["count"] / maximum).pow(0.5)
+    fig.add_trace(
+        go.Scatter(
+            x=zone_frame["x"],
+            y=zone_frame["y"],
+            mode="markers+text",
+            text=zone_frame["label"],
+            textposition="top center",
+            customdata=zone_frame[["label", "count"]],
+            hovertemplate="%{customdata[0]}<br>%{customdata[1]:,} charted shots<extra></extra>",
+            marker={
+                "size": marker_size,
+                "color": zone_frame["count"],
+                "colorscale": [[0, "#FFF176"], [1, "#F9D400"]],
+                "line": {"color": "#8A7400", "width": 1.5},
+                "showscale": False,
+            },
+            textfont={"color": "#FFFFFF", "size": 12},
+        )
+    )
+    fig.add_annotation(
+        x=0,
+        y=22.6,
+        text="Opponent court — relative direction zones",
+        showarrow=False,
+        font={"color": "#FFFFFF", "size": 13},
+    )
+    fig.add_annotation(
+        x=0,
+        y=1.1,
+        text="Player end",
+        showarrow=False,
+        font={"color": "#FFFFFF", "size": 12},
+    )
+    fig.update_layout(
+        title=f"{shot_type} direction coverage",
+        showlegend=False,
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#2F6E46",
+        margin={"l": 12, "r": 12, "t": 52, "b": 12},
+        height=570,
+    )
+    fig.update_xaxes(range=[-6.2, 6.2], visible=False, fixedrange=True)
+    fig.update_yaxes(
+        range=[-0.5, court_length + 0.5], visible=False, fixedrange=True, scaleanchor="x"
+    )
+    return fig
+
+
+def draw_shot_coverage(log: pd.DataFrame, player: str) -> None:
+    """Render a court-style categorical shot-direction coverage view."""
+    st.markdown("#### Court-style shot coverage")
+    directions = matched_shot_direction_stats(log, player)
+    if directions.empty:
+        st.info(
+            "No uniquely matched charted shot-direction data is available for this player "
+            "under the current filters."
+        )
+        return
+
+    shot_type = st.radio(
+        "Shot coverage view",
+        ["All charted shots", "Forehand", "Backhand"],
+        horizontal=True,
+        key=f"shot_coverage_{normalized_player_name(player)}",
+    )
+    selected = directions.loc[directions["shot_type"].eq(shot_type)]
+    direction_columns = list(COURT_DIRECTION_ZONES)
+    direction_totals = selected[direction_columns].sum()
+    total_shots = int(direction_totals.sum())
+    leading_direction = direction_totals.idxmax().replace("_", " ").title()
+    metrics = st.columns(3)
+    metrics[0].metric("Charted matches", f"{selected['match_id'].nunique():,}")
+    metrics[1].metric("Classified shots", f"{total_shots:,}")
+    metrics[2].metric(
+        "Most-used direction",
+        leading_direction,
+        delta=f"{direction_totals[direction_totals.idxmax()]:,} shots",
+        delta_color="off",
+    )
+    st.plotly_chart(court_coverage_figure(direction_totals, shot_type), width="stretch")
+    st.caption(
+        "This is a court-style visualization of categorical shot directions, not exact ball "
+        "landing coordinates or player-tracking positions. Circle size and color represent the "
+        "number of charted shots in each direction zone."
+    )
+
+
 def draw_player_study(frame: pd.DataFrame, player: str) -> None:
     log = player_match_log(frame, player)
     if log.empty:
@@ -1203,6 +1647,9 @@ def draw_player_study(frame: pd.DataFrame, player: str) -> None:
         ).update_yaxes(ticksuffix="%", range=[0, 100]),
         width="stretch",
     )
+
+    draw_shot_winner_summary(log, player)
+    draw_shot_coverage(log, player)
 
     st.markdown("#### Per-match averages")
     average_minutes = log["minutes"].mean()
