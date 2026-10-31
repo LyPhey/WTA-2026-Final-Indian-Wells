@@ -7,3 +7,6 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 /SOURCE_INVENTORY.csv
+.agents/skills/developing-with-streamlit
+models/
+reports/

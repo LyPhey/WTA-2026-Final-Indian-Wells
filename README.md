@@ -54,6 +54,55 @@ leaves events with no reliable location as `unavailable_no_mapped_location`—it
 never assigns weather to an inferred host city. The weather source is the
 [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api), using ERA5 reanalysis. The published city map is from [Live Tennis API](https://livetennisapi.com/tools/tournament-map). Keep both sources' CC BY 4.0 attributions in downstream outputs.
 
+### Canonical combined match file
+
+After downloading the raw sources and building the cached weather enrichment,
+create the ready-to-use, de-duplicated match table with:
+
+```bash
+python build_combined_dataset.py
+```
+
+This writes `data/processed/wta_matches_combined_deduplicated.csv`. It retains
+one record for every normalized tournament-week, tournament, round, winner,
+and loser identity. It preserves the original raw inputs and records the
+selected source in `retained_provider`, the contributing providers in
+`source_providers`, their count in `source_record_count`, and the applied
+deduplication rule. It includes environmental fields, but does not create any
+model features or train/test splits.
+
+### Leakage-safe pre-match features and baseline
+
+Create the historical training table with:
+
+```bash
+python step_05_build_pre_match_features.py
+```
+
+This writes `data/processed/wta_pre_match_features.csv`. Each row is a
+neutral Player A versus Player B record: Player A is selected alphabetically,
+not because she won. Historical form, serve, and head-to-head features use
+only completed matches from strictly earlier tournament weeks. Current-match
+score, duration, serve statistics, winner/loser fields, source-coverage
+fields, and retrospective weather are not included as model inputs.
+
+Because the match sources provide tournament-week dates rather than reliable
+match dates, the feature builder deliberately excludes all same-week results.
+This is conservative and prevents a later match in a week from accidentally
+learning from an earlier result whose timing is unknown.
+
+To fit an interpretable baseline after the feature table is built:
+
+```bash
+python step_06_train_baseline_model.py
+```
+
+The default baseline fits logistic regression through 2024 and evaluates once
+on 2025. It stores the fitted pipeline in `models/` and held-out accuracy,
+Brier score, log loss, and ROC AUC in `reports/`. It deliberately excludes
+2026 so that season remains available for a future pre-WTA-Finals retraining
+cutoff.
+
 On some networks TennisMyLife may block scripted CSV access; if you encounter an error, open https://stats.tennismylife.org/tennis-match-database and download WTA years manually into `data/raw/tennismylife/`. TennisData.App CSVs may similarly need manual browser downloads, saved separately to `data/raw/tennisdata_app/` (which this downloader intentionally does not scrape).
 
 ### Keeping data current

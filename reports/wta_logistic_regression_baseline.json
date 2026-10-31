@@ -1,0 +1,26 @@
+{
+  "model": "logistic_regression",
+  "feature_version": "v1_strict_prior_tournament_week",
+  "train_period": {
+    "rows": 23014,
+    "first_match_date": "2016-01-04",
+    "last_match_date": "2024-12-30"
+  },
+  "evaluation_period": {
+    "rows": 3388,
+    "first_match_date": "2025-01-06",
+    "last_match_date": "2025-11-14"
+  },
+  "metrics": {
+    "accuracy": 0.670307,
+    "brier_score": 0.207857,
+    "log_loss": 0.603139,
+    "roc_auc": 0.733771
+  },
+  "leakage_controls": [
+    "Every historical feature uses only strictly earlier tournament weeks.",
+    "No current-match score, duration, serve statistic, winner/loser column, or weather field is a model input.",
+    "Imputation, scaling, and categorical encoding are fit only on the training period.",
+    "The 2025 evaluation season is held out from fitting; 2026 is excluded from this baseline run."
+  ]
+}
