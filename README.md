@@ -103,6 +103,18 @@ Brier score, log loss, and ROC AUC in `reports/`. It deliberately excludes
 2026 so that season remains available for a future pre-WTA-Finals retraining
 cutoff.
 
+### Candidate-model data loader
+
+Start custom model work with:
+
+```bash
+python step_07_train_candidate_models.py
+```
+
+This script loads the leakage-safe feature table and returns chronological
+training, held-out evaluation, and future partitions for reuse in your own
+candidate-model code. It does not define, fit, or evaluate a model.
+
 On some networks TennisMyLife may block scripted CSV access; if you encounter an error, open https://stats.tennismylife.org/tennis-match-database and download WTA years manually into `data/raw/tennismylife/`. TennisData.App CSVs may similarly need manual browser downloads, saved separately to `data/raw/tennisdata_app/` (which this downloader intentionally does not scrape).
 
 ### Keeping data current
