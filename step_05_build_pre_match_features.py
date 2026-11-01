@@ -1,9 +1,9 @@
-"""Build a leakage-safe, historical WTA pre-match feature table.
+"""Build time-aware, leakage-safe WTA pre-match features.
 
-The raw match files only provide tournament-week dates, not dependable match
-dates or start times. To avoid assuming an order that the data cannot support,
-each match receives features from completed matches in strictly earlier
-tournament weeks. Results from the same tournament week are never used.
+The source files only supply tournament-week dates, not dependable match dates
+or start times. Every row therefore uses only completed results from strictly
+earlier tournament weeks. Within a week, all player histories and Elo ratings
+are frozen until every result in that week has been processed.
 
 Run from the project directory:
     python step_05_build_pre_match_features.py
@@ -26,9 +26,12 @@ import pandas as pd
 
 INPUT_PATH = Path("data/processed/wta_matches_combined_deduplicated.csv")
 OUTPUT_PATH = Path("data/processed/wta_pre_match_features.csv")
-FEATURE_VERSION = "v1_strict_prior_tournament_week"
-RECENT_WINDOW = 10
-HISTORY_METRICS = [
+FEATURE_VERSION = "v2_strict_prior_week_rolling_form_elo"
+ROLLING_WINDOWS_WEEKS = (13, 26, 52)
+RECENT_MATCH_WINDOW = 10
+ELO_INITIAL_RATING = 1_500.0
+ELO_K_FACTOR = 32.0
+MATCH_METRICS = [
     "aces_per_match",
     "double_faults_per_match",
     "first_serve_won_pct",
@@ -36,16 +39,14 @@ HISTORY_METRICS = [
     "serve_points_won_pct",
     "match_minutes",
 ]
-HISTORY_FIELDS = [
-    "prior_matches",
-    "prior_wins",
-    "prior_win_rate",
-    "prior_surface_matches",
-    "prior_surface_wins",
-    "prior_surface_win_rate",
-    "recent_10_matches",
-    "recent_10_win_rate",
-    *[f"prior_{metric}" for metric in HISTORY_METRICS],
+ROLLING_SUMMARY_FIELDS = [
+    "matches",
+    "wins",
+    "win_rate",
+    "surface_matches",
+    "surface_wins",
+    "surface_win_rate",
+    *MATCH_METRICS,
 ]
 FORBIDDEN_OUTPUT_PREFIXES = ("w_", "l_", "winner_", "loser_", "weather_")
 FORBIDDEN_OUTPUT_COLUMNS = {
@@ -58,7 +59,7 @@ FORBIDDEN_OUTPUT_COLUMNS = {
 
 
 def normalized_player_key(value: object) -> str:
-    """Create a stable, accent-insensitive player key for history tracking."""
+    """Create a stable, accent-insensitive player key for historical state."""
     if pd.isna(value):
         return ""
     ascii_value = unicodedata.normalize("NFKD", str(value)).encode(
@@ -68,7 +69,7 @@ def normalized_player_key(value: object) -> str:
 
 
 def clean_category(value: object, fallback: str = "Unknown") -> str:
-    """Return a non-empty categorical value without turning missing into zero."""
+    """Return a non-empty category without turning missing values into zero."""
     if pd.isna(value):
         return fallback
     text = str(value).strip()
@@ -76,7 +77,7 @@ def clean_category(value: object, fallback: str = "Unknown") -> str:
 
 
 def finite_number(value: object) -> float:
-    """Return a finite float or NaN for unavailable source values."""
+    """Return a finite float or NaN when a source value is unavailable."""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -85,7 +86,7 @@ def finite_number(value: object) -> float:
 
 
 def safe_ratio(numerator: object, denominator: object) -> float:
-    """Compute a rate only when the source supplies a valid positive denominator."""
+    """Calculate a rate only when its denominator is available and positive."""
     numerator_value = finite_number(numerator)
     denominator_value = finite_number(denominator)
     if np.isnan(numerator_value) or np.isnan(denominator_value) or denominator_value <= 0:
@@ -94,69 +95,109 @@ def safe_ratio(numerator: object, denominator: object) -> float:
 
 
 def difference(left: float, right: float) -> float:
-    """Return a difference without disguising an unavailable input as zero."""
+    """Preserve missingness rather than replacing unavailable differences with zero."""
     if np.isnan(left) or np.isnan(right):
         return np.nan
     return left - right
 
 
+def expected_score(player_rating: float, opponent_rating: float) -> float:
+    """Return the standard Elo expected win probability."""
+    return 1.0 / (1.0 + 10 ** ((opponent_rating - player_rating) / 400.0))
+
+
+@dataclass(frozen=True)
+class HistoricalMatch:
+    """One completed result available after its tournament week ends."""
+
+    match_date: pd.Timestamp
+    surface: str
+    won: bool
+    metrics: dict[str, float]
+
+
 @dataclass
 class PlayerHistory:
-    """Completed-match history for one player before a tournament-week cutoff."""
+    """Player state that is inspected only before the current tournament week."""
 
-    matches: int = 0
-    wins: int = 0
-    surface_matches: Counter[str] = field(default_factory=Counter)
-    surface_wins: Counter[str] = field(default_factory=Counter)
+    matches: list[HistoricalMatch] = field(default_factory=list)
     recent_results: deque[int] = field(
-        default_factory=lambda: deque(maxlen=RECENT_WINDOW)
+        default_factory=lambda: deque(maxlen=RECENT_MATCH_WINDOW)
     )
-    metric_sums: defaultdict[str, float] = field(default_factory=lambda: defaultdict(float))
-    metric_counts: Counter[str] = field(default_factory=Counter)
 
-    def snapshot(self, surface: str) -> dict[str, float]:
-        """Return only values accumulated before the current tournament week."""
-        recent_matches = len(self.recent_results)
-        values = {
-            "prior_matches": float(self.matches),
-            "prior_wins": float(self.wins),
-            "prior_win_rate": self.wins / self.matches if self.matches else np.nan,
-            "prior_surface_matches": float(self.surface_matches[surface]),
-            "prior_surface_wins": float(self.surface_wins[surface]),
-            "prior_surface_win_rate": (
-                self.surface_wins[surface] / self.surface_matches[surface]
-                if self.surface_matches[surface]
+    @staticmethod
+    def summarize(records: list[HistoricalMatch], surface: str) -> dict[str, float]:
+        """Aggregate form, surface form, and service metrics over given records."""
+        surface_records = [record for record in records if record.surface == surface]
+        summary = {
+            "matches": float(len(records)),
+            "wins": float(sum(record.won for record in records)),
+            "win_rate": (
+                sum(record.won for record in records) / len(records)
+                if records
                 else np.nan
             ),
-            "recent_10_matches": float(recent_matches),
-            "recent_10_win_rate": (
-                sum(self.recent_results) / recent_matches if recent_matches else np.nan
+            "surface_matches": float(len(surface_records)),
+            "surface_wins": float(sum(record.won for record in surface_records)),
+            "surface_win_rate": (
+                sum(record.won for record in surface_records) / len(surface_records)
+                if surface_records
+                else np.nan
             ),
         }
-        for metric in HISTORY_METRICS:
-            count = self.metric_counts[metric]
-            values[f"prior_{metric}"] = (
-                self.metric_sums[metric] / count if count else np.nan
-            )
+        for metric in MATCH_METRICS:
+            values = [record.metrics[metric] for record in records]
+            valid = [value for value in values if not np.isnan(value)]
+            summary[metric] = float(np.mean(valid)) if valid else np.nan
+        return summary
+
+    def snapshot(self, current_date: pd.Timestamp, surface: str) -> dict[str, float]:
+        """Create rolling form features from matches strictly before current_date."""
+        values: dict[str, float] = {
+            "weeks_since_last_match": (
+                (current_date - self.matches[-1].match_date).days / 7.0
+                if self.matches
+                else np.nan
+            ),
+            "recent_10_matches": float(len(self.recent_results)),
+            "recent_10_win_rate": (
+                sum(self.recent_results) / len(self.recent_results)
+                if self.recent_results
+                else np.nan
+            ),
+        }
+        for weeks in ROLLING_WINDOWS_WEEKS:
+            earliest_date = current_date - pd.Timedelta(weeks=weeks)
+            window_records = [
+                record for record in self.matches if record.match_date >= earliest_date
+            ]
+            summary = self.summarize(window_records, surface)
+            for name, value in summary.items():
+                values[f"prior_{weeks}w_{name}"] = value
         return values
 
     def add_completed_match(
-        self, *, surface: str, won: bool, metrics: dict[str, float]
+        self,
+        *,
+        match_date: pd.Timestamp,
+        surface: str,
+        won: bool,
+        metrics: dict[str, float],
     ) -> None:
-        """Update history after a completed match becomes available."""
-        self.matches += 1
-        self.wins += int(won)
-        self.surface_matches[surface] += 1
-        self.surface_wins[surface] += int(won)
+        """Make a completed result available for only future tournament weeks."""
+        self.matches.append(
+            HistoricalMatch(
+                match_date=match_date,
+                surface=surface,
+                won=won,
+                metrics=metrics,
+            )
+        )
         self.recent_results.append(int(won))
-        for metric, value in metrics.items():
-            if not np.isnan(value):
-                self.metric_sums[metric] += value
-                self.metric_counts[metric] += 1
 
 
 def player_match_metrics(row: Any, prefix: str) -> dict[str, float]:
-    """Calculate post-match player statistics for later history updates only."""
+    """Derive post-match statistics for later historical windows only."""
     serve_points = finite_number(getattr(row, f"{prefix}_svpt"))
     first_serves_in = finite_number(getattr(row, f"{prefix}_1stIn"))
     first_serves_won = finite_number(getattr(row, f"{prefix}_1stWon"))
@@ -182,7 +223,7 @@ def player_match_metrics(row: Any, prefix: str) -> dict[str, float]:
 
 
 def extract_entering_values(row: Any, side: str) -> tuple[float, float]:
-    """Return the selected player's ranking and points entering this match."""
+    """Return the selected player's ranking and ranking points before this match."""
     return (
         finite_number(getattr(row, f"{side}_rank")),
         finite_number(getattr(row, f"{side}_rank_points")),
@@ -192,7 +233,7 @@ def extract_entering_values(row: Any, side: str) -> tuple[float, float]:
 def h2h_snapshot(
     counts: Counter[str], player_a_key: str
 ) -> tuple[float, float, float]:
-    """Return pre-match meetings, Player A wins, and Player A win rate."""
+    """Return prior meetings, Player A wins, and Player A's prior win rate."""
     matches = sum(counts.values())
     player_a_wins = counts[player_a_key]
     return (
@@ -203,7 +244,7 @@ def h2h_snapshot(
 
 
 def prepare_completed_matches(source: pd.DataFrame) -> pd.DataFrame:
-    """Keep only valid, completed records eligible for historical labels."""
+    """Keep only valid, completed rows eligible for a historical target."""
     required = {
         "tourney_date",
         "winner_name",
@@ -232,14 +273,27 @@ def prepare_completed_matches(source: pd.DataFrame) -> pd.DataFrame:
     return eligible.sort_values(["match_date", "match_identity"], kind="stable")
 
 
+def feature_fields() -> list[str]:
+    """Return player-level history field names emitted in every feature row."""
+    fields = ["weeks_since_last_match", "recent_10_matches", "recent_10_win_rate"]
+    for weeks in ROLLING_WINDOWS_WEEKS:
+        fields.extend(f"prior_{weeks}w_{name}" for name in ROLLING_SUMMARY_FIELDS)
+    return fields
+
+
 def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
-    """Create neutral Player A-vs-Player B rows without outcome leakage."""
+    """Build neutral Player A-vs-Player B features without outcome leakage."""
     matches = prepare_completed_matches(source)
     players: defaultdict[str, PlayerHistory] = defaultdict(PlayerHistory)
     head_to_head: defaultdict[tuple[str, str], Counter[str]] = defaultdict(Counter)
     surface_head_to_head: defaultdict[tuple[str, str, str], Counter[str]] = defaultdict(
         Counter
     )
+    overall_elo: defaultdict[str, float] = defaultdict(lambda: ELO_INITIAL_RATING)
+    surface_elo: defaultdict[str, defaultdict[str, float]] = defaultdict(
+        lambda: defaultdict(lambda: ELO_INITIAL_RATING)
+    )
+    history_fields = feature_fields()
     records: list[dict[str, object]] = []
     prior_week: pd.Timestamp | None = None
 
@@ -259,15 +313,14 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
                 player_a_won = 0
 
             surface = clean_category(row.surface)
-            player_a_history = players[player_a_key].snapshot(surface)
-            player_b_history = players[player_b_key].snapshot(surface)
+            player_a_history = players[player_a_key].snapshot(match_date, surface)
+            player_b_history = players[player_b_key].snapshot(match_date, surface)
             player_a_rank, player_a_rank_points = extract_entering_values(
                 row, player_a_side
             )
             player_b_rank, player_b_rank_points = extract_entering_values(
                 row, player_b_side
             )
-
             h2h_key = tuple(sorted((player_a_key, player_b_key)))
             surface_h2h_key = (surface, *h2h_key)
             h2h_matches, h2h_player_a_wins, h2h_player_a_win_rate = h2h_snapshot(
@@ -279,6 +332,10 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
                 surface_h2h_player_a_win_rate,
             ) = h2h_snapshot(surface_head_to_head[surface_h2h_key], player_a_key)
 
+            player_a_elo = overall_elo[player_a_key]
+            player_b_elo = overall_elo[player_b_key]
+            player_a_surface_elo = surface_elo[surface][player_a_key]
+            player_b_surface_elo = surface_elo[surface][player_b_key]
             record: dict[str, object] = {
                 "feature_version": FEATURE_VERSION,
                 "match_date": match_date.date().isoformat(),
@@ -299,6 +356,14 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
                 "rank_points_advantage_player_a": difference(
                     player_a_rank_points, player_b_rank_points
                 ),
+                "player_a_elo": player_a_elo,
+                "player_b_elo": player_b_elo,
+                "elo_advantage_player_a": player_a_elo - player_b_elo,
+                "player_a_surface_elo": player_a_surface_elo,
+                "player_b_surface_elo": player_b_surface_elo,
+                "surface_elo_advantage_player_a": (
+                    player_a_surface_elo - player_b_surface_elo
+                ),
                 "h2h_prior_matches": h2h_matches,
                 "h2h_player_a_wins": h2h_player_a_wins,
                 "h2h_player_a_win_rate": h2h_player_a_win_rate,
@@ -307,7 +372,7 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
                 "surface_h2h_player_a_win_rate": surface_h2h_player_a_win_rate,
                 "target_player_a_won": player_a_won,
             }
-            for history_field in HISTORY_FIELDS:
+            for history_field in history_fields:
                 player_a_value = player_a_history[history_field]
                 player_b_value = player_b_history[history_field]
                 record[f"player_a_{history_field}"] = player_a_value
@@ -317,15 +382,42 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
                 )
             records.append(record)
 
+        overall_deltas: defaultdict[str, float] = defaultdict(float)
+        surface_deltas: defaultdict[str, float] = defaultdict(float)
         for row in week_matches.itertuples(index=False):
             surface = clean_category(row.surface)
-            winner_metrics = player_match_metrics(row, "w")
-            loser_metrics = player_match_metrics(row, "l")
+            winner_rating = overall_elo[row.winner_key]
+            loser_rating = overall_elo[row.loser_key]
+            winner_delta = ELO_K_FACTOR * (1.0 - expected_score(winner_rating, loser_rating))
+            overall_deltas[row.winner_key] += winner_delta
+            overall_deltas[row.loser_key] -= winner_delta
+
+            winner_surface_rating = surface_elo[surface][row.winner_key]
+            loser_surface_rating = surface_elo[surface][row.loser_key]
+            winner_surface_delta = ELO_K_FACTOR * (
+                1.0 - expected_score(winner_surface_rating, loser_surface_rating)
+            )
+            surface_deltas[(surface, row.winner_key)] += winner_surface_delta
+            surface_deltas[(surface, row.loser_key)] -= winner_surface_delta
+
+        for player_key, delta in overall_deltas.items():
+            overall_elo[player_key] += delta
+        for (surface, player_key), delta in surface_deltas.items():
+            surface_elo[surface][player_key] += delta
+
+        for row in week_matches.itertuples(index=False):
+            surface = clean_category(row.surface)
             players[row.winner_key].add_completed_match(
-                surface=surface, won=True, metrics=winner_metrics
+                match_date=match_date,
+                surface=surface,
+                won=True,
+                metrics=player_match_metrics(row, "w"),
             )
             players[row.loser_key].add_completed_match(
-                surface=surface, won=False, metrics=loser_metrics
+                match_date=match_date,
+                surface=surface,
+                won=False,
+                metrics=player_match_metrics(row, "l"),
             )
             matchup_key = tuple(sorted((row.winner_key, row.loser_key)))
             head_to_head[matchup_key][row.winner_key] += 1
@@ -338,14 +430,16 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
 
 
 def validate_feature_table(features: pd.DataFrame) -> None:
-    """Fail loudly if the generated table violates its leakage controls."""
+    """Fail loudly when generated features violate their temporal controls."""
     required = {
         "match_date",
         "feature_cutoff_date",
         "player_a",
         "player_b",
         "target_player_a_won",
-        "rank_advantage_player_a",
+        "elo_advantage_player_a",
+        "prior_13w_win_rate_advantage_player_a",
+        "prior_52w_surface_win_rate_advantage_player_a",
     }
     missing = sorted(required - set(features.columns))
     if missing:
@@ -360,12 +454,10 @@ def validate_feature_table(features: pd.DataFrame) -> None:
         raise ValueError(f"Feature output contains leakage-prone columns: {forbidden}")
     if not features["target_player_a_won"].isin([0, 1]).all():
         raise ValueError("The target must contain only binary Player A outcomes.")
-
     match_dates = pd.to_datetime(features["match_date"], errors="coerce")
     cutoff_dates = pd.to_datetime(features["feature_cutoff_date"], errors="coerce")
-    invalid_cutoffs = cutoff_dates.notna() & cutoff_dates.ge(match_dates)
-    if invalid_cutoffs.any():
-        raise ValueError("A feature row uses history from its own or a later week.")
+    if (cutoff_dates.notna() & cutoff_dates.ge(match_dates)).any():
+        raise ValueError("A row uses feature history from its own or a later week.")
 
 
 def main() -> int:
@@ -382,7 +474,7 @@ def main() -> int:
     print(f"Columns: {len(features.columns):,}")
     print(
         "History policy: strictly earlier tournament weeks; "
-        "same-week results are excluded."
+        "same-week results and Elo updates are excluded."
     )
     return 0
 

@@ -1625,17 +1625,23 @@ def draw_player_study(frame: pd.DataFrame, player: str) -> None:
     retirement_rate = pct(player_retirements, len(log))
     matchup_order = ["Same-handed opponent", "Opposite-handed opponent"]
     hand_matchups = log[log["hand_matchup"].isin(matchup_order)]
-    hand_summary = (
+    observed_hand_summary = (
         hand_matchups.groupby("hand_matchup", as_index=False)
         .agg(
             matches=("result", "size"),
             wins=("result", lambda results: (results == "Win").sum()),
         )
-        .set_index("hand_matchup")
-        .reindex(matchup_order, fill_value=0)
-        .rename_axis("hand_matchup")
-        .reset_index()
     )
+    # Build the two expected categories separately.  With no recorded player hand,
+    # pandas 3 creates an empty string-typed ``wins`` column; filling that column
+    # with integer zero during ``reindex`` raises a TypeError.
+    hand_summary = pd.DataFrame({"hand_matchup": matchup_order}).merge(
+        observed_hand_summary, on="hand_matchup", how="left"
+    )
+    for column in ["matches", "wins"]:
+        hand_summary[column] = (
+            pd.to_numeric(hand_summary[column], errors="coerce").fillna(0).astype(int)
+        )
     hand_summary["losses"] = hand_summary["matches"] - hand_summary["wins"]
     hand_summary["win_rate_pct"] = (
         100 * hand_summary["wins"] / hand_summary["matches"].replace(0, pd.NA)
@@ -1724,23 +1730,29 @@ def draw_player_study(frame: pd.DataFrame, player: str) -> None:
         delta_color="off",
         help="A comparison needs a recorded hand for both the player and opponent.",
     )
-    st.plotly_chart(
-        px.bar(
-            hand_summary.dropna(subset=["win_rate_pct"]),
-            x="hand_matchup",
-            y="win_rate_pct",
-            text="matches",
-            color="hand_matchup",
-            category_orders={"hand_matchup": matchup_order},
-            labels={
-                "hand_matchup": "Opponent hand matchup",
-                "win_rate_pct": "Win rate (%)",
-                "matches": "Matches",
-            },
-            title="Win rate by opponent hitting hand (label = matches)",
-        ).update_yaxes(ticksuffix="%", range=[0, 100]),
-        width="stretch",
-    )
+    if hand_matchups.empty:
+        st.info(
+            "Opponent playing-hand data is unavailable for the selected matches, "
+            "so same- and opposite-handed comparisons cannot be shown."
+        )
+    else:
+        st.plotly_chart(
+            px.bar(
+                hand_summary.dropna(subset=["win_rate_pct"]),
+                x="hand_matchup",
+                y="win_rate_pct",
+                text="matches",
+                color="hand_matchup",
+                category_orders={"hand_matchup": matchup_order},
+                labels={
+                    "hand_matchup": "Opponent hand matchup",
+                    "win_rate_pct": "Win rate (%)",
+                    "matches": "Matches",
+                },
+                title="Win rate by opponent hitting hand (label = matches)",
+            ).update_yaxes(ticksuffix="%", range=[0, 100]),
+            width="stretch",
+        )
 
     draw_match_charting_profile(log, player)
 
