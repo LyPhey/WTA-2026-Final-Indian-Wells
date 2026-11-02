@@ -63,13 +63,18 @@ create the ready-to-use, de-duplicated match table with:
 python build_combined_dataset.py
 ```
 
-This writes `data/processed/wta_matches_combined_deduplicated.csv`. It retains
+This writes `data/processed/wta_matches_combined_deduplicated.csv` and the
+audit file `data/quality/tournament_alias_deduplication_report.csv`. It retains
 one record for every normalized tournament-week, tournament, round, winner,
-and loser identity. It preserves the original raw inputs and records the
-selected source in `retained_provider`, the contributing providers in
-`source_providers`, their count in `source_record_count`, and the applied
-deduplication rule. It includes environmental fields, but does not create any
-model features or train/test splits.
+and loser identity. It also consolidates differently named tournament records
+only when the week, round, winner, loser, normalized score, and surface all
+agree. Possible aliases with conflicting or incomplete evidence remain separate
+and are listed as `review_required` in the audit file. The combined output
+preserves the original raw inputs and records the selected source in
+`retained_provider`, the contributing providers in `source_providers`, their
+count in `source_record_count`, and the applied deduplication rule. It includes
+environmental fields, but does not create any model features or train/test
+splits.
 
 ### Leakage-safe pre-match features and baseline
 

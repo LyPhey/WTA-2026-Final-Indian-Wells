@@ -29,6 +29,8 @@ from collections.abc import Callable
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import OneHotEncoder
 
+from xgboost import XGBClassifier
+
 
 INPUT_PATH = Path("data/processed/wta_pre_match_features.csv")
 TARGET_COLUMN = "target_player_a_won"
@@ -203,6 +205,51 @@ def build_random_forest_pipeline(feature_columns: list[str]) -> Pipeline:
     )
 
 
+def build_xgboost_pipeline(feature_columns: list[str]) -> Pipeline:
+    numeric_columns = [
+        column 
+        for column in feature_columns
+        if column not in CATEGORICAL_COLUMNS
+    ]
+
+    preprocessor = ColumnTransformer(
+        [
+            (
+                "numeric",
+                SimpleImputer(strategy="median", add_indicator = True),
+                numeric_columns,
+            ),
+            (
+                "categorical",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy = 'most_frequent')),
+                        ('encoder', OneHotEncoder(handle_unknown='ignore')),
+                    ]
+                ),
+                CATEGORICAL_COLUMNS,
+            ),
+        ]
+    )
+
+    return Pipeline(
+        [
+            ("preprocessor", preprocessor),
+            (
+                "model",
+                XGBClassifier(
+                    objective= 'binary:logistic',
+                    max_depth= 4,
+                    learning_rate= 0.1,
+                    n_estimators= 100,
+                ),
+            ),
+        ]
+    )
+
+
+
+
 def calculate_metrics(
     actual: pd.Series, probability_player_a_wins: pd.Series
 ) -> dict[str, float]:
@@ -339,6 +386,7 @@ def main() -> int:
     candidates = [
         ("hist_gradient_boosting_v1", build_candidate_pipeline),
         ("random_forest_v1", build_random_forest_pipeline),
+        ("xgboost_v1", build_xgboost_pipeline),
     ]
 
     comparison_rows = []
