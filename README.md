@@ -136,6 +136,40 @@ latest-fold pipeline plus an auditable report in `models/` and `reports/`.
 Use this structure when adding more candidate models so every candidate is
 compared using identical training windows and held-out years.
 
+### Nested hyperparameter tuning
+
+Use `step_08_hyperparameter_tuning.py` to tune the logistic-regression and
+random-forest candidates without selecting parameters on their outer held-out
+years:
+
+```bash
+python step_08_hyperparameter_tuning.py
+```
+
+For every annual outer fold, its prior four calendar years are divided into
+expanding inner validation folds at whole tournament-week boundaries.
+`GridSearchCV` fits imputation, scaling, encoding, and the model separately in
+each inner training split, chooses the lowest inner log loss, refits on the
+outer training window, and finally scores the untouched outer year. The default
+grids are intentionally bounded: six logistic-regression configurations and
+eight random-forest configurations. New models belong in the script's
+`MODEL_SPECS` registry, with their own pipeline builder and parameter grid.
+
+The script does not replace the step-06 or step-07 artifacts. It writes tuned
+latest-fold pipelines under `models/hyperparameter_tuning/` and an auditable
+JSON report, per-fold grid-result CSVs, and a comparison CSV under
+`reports/hyperparameter_tuning/`. A smaller smoke run is useful before the full
+search:
+
+```bash
+python step_08_hyperparameter_tuning.py \
+  --models logistic_regression \
+  --first-evaluation-year 2025 \
+  --last-evaluation-year 2025 \
+  --inner-splits 2 \
+  --n-jobs 1
+```
+
 On some networks TennisMyLife may block scripted CSV access; if you encounter an error, open https://stats.tennismylife.org/tennis-match-database and download WTA years manually into `data/raw/tennismylife/`. TennisData.App CSVs may similarly need manual browser downloads, saved separately to `data/raw/tennisdata_app/` (which this downloader intentionally does not scrape).
 
 ### Keeping data current
