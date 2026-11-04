@@ -174,7 +174,71 @@ On some networks TennisMyLife may block scripted CSV access; if you encounter an
 
 ### Keeping data current
 
-Re-run `python download_data.py --provider tennismylife --overwrite` for new 2026 source files. Log the date of the update. DO NOT overwrite your evaluation snapshots used for earlier match predictions: pre-match forecasting requires the information available *at that time*.
+For routine updates, use the dashboard's **Fetch Data — merge full history** action.
+It is append-only and preserves every row already retained locally. The standalone
+`download_data.py --overwrite` command intentionally replaces individual source
+files, so reserve it for a deliberate manual reset after saving a snapshot. Log
+the date of every update. DO NOT overwrite your evaluation snapshots used for
+earlier match predictions: pre-match forecasting requires the information
+available *at that time*.
+
+### Live WTA Finals dashboard
+
+After the canonical file and pre-match feature table have been built, start the
+dashboard with:
+
+```bash
+streamlit run step_04_data_explorer_dashboard.py
+```
+
+The **Fetch data** tab has a **Fetch Data — merge full history** button. It
+downloads the available 2016–2026 TennisMyLife history into an intake area,
+compares it with the locally retained provider files, and appends only exact-new
+raw rows. Existing raw rows are never removed or replaced. It saves the prior,
+incoming, and merged provider files under `data/snapshots/daily_refresh/`, then
+rebuilds the canonical table and pre-match features. It does not overwrite a saved model artifact:
+each displayed prediction fits the configured logistic model in memory using a
+four-year history ending before the selected tournament week.
+
+Select two players and enter their official pre-match WTA singles rank and
+ranking points manually. The dashboard does not treat rank/point values from
+match providers as official current rankings; a field left at `0` is unknown and
+is imputed by the model. Each forecast states that the ranking inputs were
+entered manually. The dashboard displays both complementary win
+probabilities—for example, `65%` and `35%`—rather than only a predicted winner.
+A `RR` round means round-robin group play. A loss does not eliminate a player
+in the interface, and the dashboard makes no elimination inference.
+
+### Tournament-aware rounds
+
+The first control in **Live predictions** is now the tournament category. A
+Grand Slam exposes Australian Open, Roland Garros, Wimbledon, and US Open,
+sets the correct surface automatically, and offers the seven stages of a
+128-player knockout draw. The Australian Open's official draw explainer
+confirms that all four Grand Slams use 128-player singles main draws.
+
+For WTA 250, WTA 500, and WTA 1000 events, the dashboard asks for the
+event's published main-draw bracket before it offers a round. That extra choice
+is intentional: the [WTA rulebook](https://www.wtatennis.com/news/1347389/wta-rules)
+permits several main-draw sizes, including 28/30/32, 48/56/64, and 96, with
+byes in non-power-of-two draws. The interface therefore never guesses a
+round structure from tier alone. It labels the resulting choices as the opening
+round, Round of 32, Round of 16, quarterfinal, semifinal, and final as
+appropriate to that bracket.
+
+For WTA Finals, the dashboard offers Round Robin 1, 2, and 3, then semifinal
+and final. The official WTA format is two groups of four, with every player
+facing the other three and the top two in each group advancing to the knockout
+stage. See the [WTA Finals overview](https://www.wtatennis.com/tournaments/wta-finals)
+and [Australian Open draw explainer](https://ausopen.com/articles/news/how-grand-slam-tournament-draws-are-made)
+for the source format details.
+
+The feeds use tournament-week dates, not reliable individual match days. For
+that reason, the live model excludes all results dated in the selected week,
+including earlier group-stage results found by a same-week refresh. That is a
+deliberate conservative safeguard: it guarantees every input was available
+before the predicted match rather than accidentally leaking a result whose exact
+time is unknown.
 
 ## Dataset boundaries / modeling cautions
 

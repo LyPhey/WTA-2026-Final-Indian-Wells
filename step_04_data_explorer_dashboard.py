@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import date
 from io import BytesIO
 import re
+import subprocess
 import unicodedata
 from typing import Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -22,6 +23,16 @@ from environmental_data_pipeline import (
     ENVIRONMENT_COLUMNS,
     TOURNAMENT_WEEK_WEATHER_PATH,
     enrich_matches_with_environment,
+)
+from live_prediction_pipeline import (
+    CANONICAL_MATCHES_PATH,
+    FEATURES_PATH,
+    TML_RAW_DIR,
+    available_players,
+    data_freshness,
+    load_canonical_matches,
+    predict_live_match,
+    refresh_daily_data,
 )
 from step_02_load_and_compatre_providers import load_provider
 
@@ -79,6 +90,43 @@ WTA_API_BASE = "https://api.wtatennis.com"
 WTA_PHOTO_QUERY_LIMIT = 20
 WTA_RESOURCE_VERSION = "v7.53.16"
 HAND_LABELS = {"R": "Right-handed", "L": "Left-handed"}
+TOURNAMENT_LEVELS = {
+    "Grand Slam": "G",
+    "WTA 1000": "1000",
+    "WTA 500": "500",
+    "WTA 250": "250",
+    "WTA Finals": "F",
+}
+GRAND_SLAM_SURFACES = {
+    "Australian Open": "Hard",
+    "Roland Garros": "Clay",
+    "Wimbledon": "Grass",
+    "US Open": "Hard",
+}
+KNOCKOUT_DRAW_FORMATS = {
+    "WTA 250": {
+        "28 / 30 / 32-player main draw": ["R32", "R16", "QF", "SF", "F"],
+        "48 / 56 / 64-player main draw": ["R64", "R32", "R16", "QF", "SF", "F"],
+    },
+    "WTA 500": {
+        "28 / 30 / 32-player main draw": ["R32", "R16", "QF", "SF", "F"],
+        "48 / 56 / 64-player main draw": ["R64", "R32", "R16", "QF", "SF", "F"],
+    },
+    "WTA 1000": {
+        "28 / 30 / 32-player main draw": ["R32", "R16", "QF", "SF", "F"],
+        "48 / 56 / 64-player main draw": ["R64", "R32", "R16", "QF", "SF", "F"],
+        "96-player main draw (32 byes)": ["R128", "R64", "R32", "R16", "QF", "SF", "F"],
+    },
+}
+ROUND_LABELS = {
+    "R128": "Round of 128",
+    "R64": "Round of 64",
+    "R32": "Round of 32",
+    "R16": "Round of 16",
+    "QF": "Quarterfinal",
+    "SF": "Semifinal",
+    "F": "Final",
+}
 MCP_WTA_OVERVIEW_URL = (
     "https://raw.githubusercontent.com/JeffSackmann/tennis_MatchChartingProject/"
     "master/charting-w-stats-Overview.csv"
@@ -613,10 +661,23 @@ def environmental_cache_token() -> int:
         return 0
 
 
+def raw_data_cache_token() -> tuple[int, int, int]:
+    """Invalidate dashboard caches after a raw-data or feature-table refresh."""
+    raw_paths = tuple(TML_RAW_DIR.glob("*.csv"))
+    raw_version = max((path.stat().st_mtime_ns for path in raw_paths), default=0)
+    paths = (CANONICAL_MATCHES_PATH, FEATURES_PATH)
+    return (
+        raw_version,
+        *(path.stat().st_mtime_ns if path.exists() else 0 for path in paths),
+    )
+
+
 @st.cache_data(show_spinner="Loading source files…")
-def load_all_matches(environment_version: int) -> pd.DataFrame:
+def load_all_matches(
+    environment_version: int, raw_data_version: tuple[int, int, int]
+) -> pd.DataFrame:
     """Load both raw sources and add dashboard-only quality fields."""
-    del environment_version
+    del environment_version, raw_data_version
     frames = []
     for display_name, (provider, pattern) in SOURCE_SPECS.items():
         frame = load_provider(provider, pattern).copy()
@@ -2033,40 +2094,415 @@ def draw_match_finder(frame: pd.DataFrame) -> None:
     )
 
 
-def main() -> None:
-    st.title("WTA data-quality explorer")
+@st.cache_data(show_spinner="Loading the canonical prediction history…")
+def load_live_prediction_source(raw_data_version: tuple[int, int, int]) -> pd.DataFrame:
+    """Cache the canonical history until a refresh changes one of its inputs."""
+    del raw_data_version
+    return load_canonical_matches()
+
+
+def entered_ranking_summary(
+    player_name: str, rank: float | None, points: float | None
+) -> str:
+    """Describe exactly which official-ranking inputs the user supplied."""
+    rank_text = f"World No. {rank:,.0f}" if rank is not None else "rank not supplied"
+    points_text = f"{points:,.0f} points" if points is not None else "points not supplied"
+    return f"{player_name}: {rank_text}, {points_text}"
+
+
+def positive_or_none(value: float) -> float | None:
+    """Treat zero in the dashboard's optional numeric fields as unavailable."""
+    return float(value) if value > 0 else None
+
+
+def direct_elimination_round_options(round_codes: list[str]) -> list[tuple[str, str]]:
+    """Label a draw's rounds in the order in which players encounter them."""
+    return [
+        (f"{ROUND_LABELS[round_code]} · Round {index}", round_code)
+        for index, round_code in enumerate(round_codes, start=1)
+    ]
+
+
+def draw_data_refresh() -> None:
+    """Fetch and rebuild the daily data independently of match predictions."""
+    st.subheader("Fetch updated WTA data")
     st.caption(
-        "Inspect source coverage, incomplete outcomes, field availability, and shared match records."
+        "Refresh the full retained TennisMyLife history, append only new raw rows, and rebuild "
+        "the canonical history and leakage-safe feature table."
+    )
+
+    notice = st.session_state.pop("live_refresh_notice", None)
+    if notice:
+        st.success(notice)
+    freshness = data_freshness()
+    left, middle, right = st.columns(3)
+    left.metric("Retained source rows", f"{freshness['rows']:,}")
+    middle.metric("Historical coverage", freshness["coverage"] or "unavailable")
+    right.metric("Latest tournament week", freshness["latest_tournament_week"] or "unavailable")
+    st.caption(f"Last local source update: {freshness['file_modified_utc'] or 'unavailable'}")
+
+    if st.button("Fetch Data — merge full history", type="primary", key="live_fetch_data"):
+        with st.spinner("Saving a snapshot, merging new rows, and rebuilding safe features…"):
+            try:
+                refresh = refresh_daily_data()
+            except (FileNotFoundError, RuntimeError, subprocess.TimeoutExpired) as error:
+                st.error(
+                    "Fresh-data update failed before the history merge completed. The prior raw "
+                    f"snapshot was preserved for recovery.\n\n{error}"
+                )
+            else:
+                st.session_state["live_refresh_notice"] = (
+                    f"Full history refreshed. Appended {refresh.appended_rows:,} new raw rows across "
+                    f"{refresh.merged_files} provider files. Before/after copies were saved under "
+                    f"{refresh.snapshot_dir.relative_to(CANONICAL_MATCHES_PATH.parent.parent.parent)}."
+                )
+                st.cache_data.clear()
+                st.rerun()
+
+
+def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
+    """Provide one explicit, pre-match WTA Finals probability at a time."""
+    st.markdown(
+        """
+        <style>
+        .live-prediction-hero {
+            background: linear-gradient(120deg, #061a31 0%, #0a4265 55%, #08736d 100%);
+            border-radius: 18px;
+            color: #ffffff;
+            margin: 0 0 1.25rem 0;
+            padding: 1.7rem 1.9rem;
+        }
+        .live-prediction-kicker {
+            color: #a7f3d0;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.13em;
+            margin-bottom: 0.3rem;
+        }
+        .live-prediction-title {
+            font-size: 2rem;
+            font-weight: 700;
+            letter-spacing: -0.035em;
+            line-height: 1.08;
+            margin: 0;
+        }
+        .live-prediction-copy {
+            color: #dbeafe;
+            font-size: 0.98rem;
+            margin: 0.55rem 0 0;
+        }
+        .live-versus {
+            color: #64748b;
+            font-size: 0.82rem;
+            font-weight: 800;
+            letter-spacing: 0.1em;
+            margin-top: 2rem;
+            text-align: center;
+        }
+        </style>
+        <section class="live-prediction-hero">
+            <div class="live-prediction-kicker">TOURNAMENT MATCH DESK</div>
+            <h2 class="live-prediction-title">Pre-match win probability</h2>
+            <p class="live-prediction-copy">Compare an upcoming matchup with a cutoff-safe
+            model. Tournament format controls the valid round choices.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    try:
+        source = load_live_prediction_source(raw_data_version)
+    except (FileNotFoundError, ValueError) as error:
+        st.error(f"Live predictions are unavailable: {error}")
+        return
+    players = available_players(source)
+    if len(players) < 2:
+        st.warning("At least two player names are required in the canonical match history.")
+        return
+
+    with st.container(border=True):
+        st.markdown("#### Match setup")
+        st.caption("Start with the tournament format; only its valid stages can be selected.")
+        category_column, format_column, surface_column, round_column = st.columns(4)
+        with category_column:
+            tournament_category = st.selectbox(
+                "Tournament category",
+                list(TOURNAMENT_LEVELS),
+                key="live_tournament_category",
+            )
+        tourney_level = TOURNAMENT_LEVELS[tournament_category]
+
+        with format_column:
+            if tournament_category == "Grand Slam":
+                grand_slam = st.selectbox(
+                    "Grand Slam", list(GRAND_SLAM_SURFACES), key="live_grand_slam"
+                )
+                selected_surface = GRAND_SLAM_SURFACES[grand_slam]
+                round_options = direct_elimination_round_options(
+                    ["R128", "R64", "R32", "R16", "QF", "SF", "F"]
+                )
+            elif tournament_category == "WTA Finals":
+                st.text_input("Format", value="8 players · two round-robin groups", disabled=True)
+                round_options = [
+                    ("Round robin 1", "RR"),
+                    ("Round robin 2", "RR"),
+                    ("Round robin 3", "RR"),
+                    ("Semifinal", "SF"),
+                    ("Final", "F"),
+                ]
+            else:
+                draw_formats = KNOCKOUT_DRAW_FORMATS[tournament_category]
+                selected_draw_format = st.selectbox(
+                    "Main-draw bracket",
+                    list(draw_formats),
+                    key=f"live_draw_format_{tourney_level}",
+                    help="Use the published main-draw size for this specific event.",
+                )
+                round_options = direct_elimination_round_options(
+                    draw_formats[selected_draw_format]
+                )
+
+        with surface_column:
+            if tournament_category == "Grand Slam":
+                st.text_input("Surface", value=selected_surface, disabled=True)
+            else:
+                selected_surface = st.selectbox(
+                    "Surface", ["Hard", "Clay", "Grass"], key="live_surface"
+                )
+
+        with round_column:
+            selected_round_label = st.selectbox(
+                "Round",
+                [label for label, _ in round_options],
+                key=f"live_round_{tourney_level}",
+            )
+            selected_round = dict(round_options)[selected_round_label]
+
+        if tournament_category == "WTA Finals":
+            st.caption(
+                "Group play has three round-robin stages; players remain selectable after a loss. "
+                "The top two in each group advance to the semifinals."
+            )
+        elif tournament_category == "Grand Slam":
+            st.caption("Grand Slam singles is a 128-player knockout draw with seven rounds.")
+        else:
+            st.caption(
+                "WTA tour levels can use different main-draw sizes. The bracket selection above "
+                "keeps the stage list accurate for the chosen event."
+            )
+
+    st.markdown("#### Player comparison")
+    st.caption("Select either player first; probability is shown in the same left-to-right order.")
+    first_player_column, versus_column, second_player_column = st.columns([5, 1, 5])
+    with first_player_column:
+        player_one = st.selectbox("Player 1", players, key="live_player_one")
+    with versus_column:
+        st.markdown('<div class="live-versus">VS</div>', unsafe_allow_html=True)
+    with second_player_column:
+        player_two_options = [player for player in players if player != player_one]
+        player_two = st.selectbox("Player 2", player_two_options, key="live_player_two")
+
+    st.caption(
+        "Tournament and player choices update the available setup. The prediction itself runs "
+        "only after you submit the fields below."
+    )
+    with st.form("live_prediction_form", border=False):
+        with st.container(border=True):
+            st.markdown("#### Match timing")
+            date_column, cutoff_column = st.columns(2)
+            with date_column:
+                match_date = st.date_input(
+                    "Match date",
+                    value=date.today(),
+                    key="live_match_date",
+                    help="Shown in the forecast record; it does not change the feature cutoff.",
+                )
+            with cutoff_column:
+                tournament_week_start = st.date_input(
+                    "Tournament start date (model cutoff)",
+                    value=match_date,
+                    help=(
+                        "Enter the first day of the tournament, not this match's day. Results dated "
+                        "within this tournament are excluded to preserve the leakage-safe feature policy."
+                    ),
+                    key="live_tournament_week_start",
+                )
+
+        with st.container(border=True):
+            st.markdown("#### Official WTA ranking context")
+            st.caption(
+                "Enter the official WTA singles world rank and ranking points published before "
+                "the match. Do not enter tournament seed, draw position, prize money, or points "
+                "earned in this match. Leave a field at 0 only when it is unknown; the model "
+                "will treat it as missing rather than using a local-match fallback."
+            )
+            rank_left, rank_right = st.columns(2)
+            with rank_left:
+                entered_rank_one = st.number_input(
+                    f"{player_one} official WTA singles rank before match",
+                    min_value=0,
+                    max_value=5_000,
+                    value=0,
+                    key=f"live_rank_one_{player_one}",
+                    help="World ranking position, such as 9 for World No. 9; not tournament seed.",
+                )
+                entered_points_one = st.number_input(
+                    f"{player_one} official WTA ranking points before match",
+                    min_value=0.0,
+                    max_value=10_000_000.0,
+                    value=0.0,
+                    step=1.0,
+                    key=f"live_points_one_{player_one}",
+                    help="Official WTA ranking total; not prize money or match points.",
+                )
+            with rank_right:
+                entered_rank_two = st.number_input(
+                    f"{player_two} official WTA singles rank before match",
+                    min_value=0,
+                    max_value=5_000,
+                    value=0,
+                    key=f"live_rank_two_{player_two}",
+                    help="World ranking position, such as 9 for World No. 9; not tournament seed.",
+                )
+                entered_points_two = st.number_input(
+                    f"{player_two} official WTA ranking points before match",
+                    min_value=0.0,
+                    max_value=10_000_000.0,
+                    value=0.0,
+                    step=1.0,
+                    key=f"live_points_two_{player_two}",
+                    help="Official WTA ranking total; not prize money or match points.",
+                )
+
+        _, action_column, _ = st.columns([1, 2, 1])
+        with action_column:
+            generate_prediction = st.form_submit_button(
+                "Submit & generate probabilities",
+                type="primary",
+                width="stretch",
+            )
+
+    if generate_prediction:
+        manual_rank_one = positive_or_none(entered_rank_one)
+        manual_rank_two = positive_or_none(entered_rank_two)
+        manual_points_one = positive_or_none(entered_points_one)
+        manual_points_two = positive_or_none(entered_points_two)
+        with st.spinner("Building a cutoff-safe feature row and fitting the live model…"):
+            try:
+                prediction = predict_live_match(
+                    source,
+                    player_one=player_one,
+                    player_two=player_two,
+                    tournament_week_start=tournament_week_start,
+                    surface=selected_surface,
+                    tourney_level=tourney_level,
+                    round_name=selected_round,
+                    player_one_rank=manual_rank_one,
+                    player_two_rank=manual_rank_two,
+                    player_one_rank_points=manual_points_one,
+                    player_two_rank_points=manual_points_two,
+                )
+            except (FileNotFoundError, RuntimeError, ValueError) as error:
+                st.error(f"Could not create this prediction.\n\n{error}")
+            else:
+                probability_one = prediction["player_one_probability"]
+                probability_two = prediction["player_two_probability"]
+                st.markdown("#### Forecast")
+                with st.container(border=True):
+                    one, label, two = st.columns([4, 2, 4])
+                    one.metric(player_one, f"{probability_one:.1%}")
+                    with label:
+                        st.markdown('<div class="live-versus">WIN PROBABILITY</div>', unsafe_allow_html=True)
+                    two.metric(player_two, f"{probability_two:.1%}")
+                    st.progress(
+                        probability_one,
+                        text=(
+                            f"{player_one} {probability_one:.1%}  ·  "
+                            f"{player_two} {probability_two:.1%}"
+                        ),
+                    )
+                    st.caption("The probabilities are complementary and sum to 100%.")
+                    st.caption(
+                        "Forecast context: "
+                        f"{tournament_category} · {selected_round_label} · {selected_surface}. "
+                        "Official WTA ranking form values — "
+                        f"{entered_ranking_summary(player_one, manual_rank_one, manual_points_one)}; "
+                        f"{entered_ranking_summary(player_two, manual_rank_two, manual_points_two)}. "
+                        "Fields left at 0 are treated as unknown."
+                    )
+
+                with st.expander("Forecast details"):
+                    st.write(
+                        f"Model: {prediction['model']} · training rows: "
+                        f"{prediction['training_rows']:,} · training window: "
+                        f"{prediction['training_start_date']} to "
+                        f"{prediction['training_end_date']}."
+                    )
+                    st.write(
+                        f"Selected tournament week: {prediction['tournament_week_start']} · "
+                        f"displayed match date: {match_date}."
+                    )
+                    st.write(
+                        "Ranking provenance: only values entered in this forecast form were used. "
+                        "Fields left at 0 were treated as unknown. No ranking or point value was "
+                        "taken from local match records."
+                    )
+
+    with st.expander("Pre-match safeguards"):
+        st.write(
+            "Round-robin group play is not a knockout bracket: a loss does not remove a "
+            "player from later matchup selection, and this dashboard never infers elimination."
+        )
+        st.write(
+            "Source records are dated to a tournament week rather than a reliable match day. "
+            "Results from the selected week are excluded from every prediction in that week, "
+            "even after a daily refresh."
+        )
+
+
+def main() -> None:
+    st.title("WTA data explorer and live prediction workspace")
+    st.caption(
+        "Inspect source coverage and create leakage-safe pre-match WTA Finals probabilities."
     )
     try:
-        all_matches = load_all_matches(environmental_cache_token())
+        raw_data_version = raw_data_cache_token()
+        all_matches = load_all_matches(environmental_cache_token(), raw_data_version)
     except ValueError as error:
         st.error(f"Could not load the raw source files: {error}")
         st.stop()
 
     selected_matches = select_rows(all_matches)
-    overview, missingness, comparison, combined, environmental, finder = st.tabs(
-        [
-            "Overview",
-            "Missingness",
-            "Source comparison",
-            "Combined source",
-            "Environmental data",
-            "Match finder",
-        ]
+    data_management, finder, live = st.tabs(
+        ["Data Management", "Match finder", "Live predictions"]
     )
-    with overview:
-        draw_overview(selected_matches)
-    with missingness:
-        draw_missingness(selected_matches)
-    with comparison:
-        draw_source_comparison(selected_matches)
-    with combined:
-        draw_combined_source(selected_matches)
-    with environmental:
-        draw_environmental_data(selected_matches)
+    with data_management:
+        fetch, overview, missingness, comparison, combined, environmental = st.tabs(
+            [
+                "Fetch data",
+                "Overview",
+                "Missingness",
+                "Source comparison",
+                "Combined source",
+                "Environmental data",
+            ]
+        )
+        with fetch:
+            draw_data_refresh()
+        with overview:
+            draw_overview(selected_matches)
+        with missingness:
+            draw_missingness(selected_matches)
+        with comparison:
+            draw_source_comparison(selected_matches)
+        with combined:
+            draw_combined_source(selected_matches)
+        with environmental:
+            draw_environmental_data(selected_matches)
     with finder:
         draw_match_finder(selected_matches)
+    with live:
+        draw_live_predictions(raw_data_version)
 
 
 if __name__ == "__main__":
