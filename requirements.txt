@@ -1,6 +1,6 @@
 pandas>=2.0,<4.0
 requests>=2.31,<3.0
-plotly>=5.0,<7.0
+plotly>=5.0,<8.0
 streamlit>=1.51,<2.0
 scikit-learn>=1.4,<2.0
-xgboost==3.4.1
+xgboost>=3.2,<4.0

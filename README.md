@@ -20,9 +20,11 @@ message and put them together in a folder; they work without the ZIP. The
 
 ## Start here
 
-From this folder, with Python 3.10+ and internet:
+From this folder, activate the project's Conda `datascience` environment
+(Python 3.11) before running any command:
 
 ```bash
+conda activate datascience
 python -m pip install -r requirements.txt
 python download_data.py --dry-run
 python download_data.py --start-year 2016 --end-year 2026 --rankings
@@ -146,8 +148,10 @@ years:
 python step_08_hyperparameter_tuning.py
 ```
 
-For every annual outer fold, its prior four calendar years are divided into
-expanding inner validation folds at whole tournament-week boundaries.
+For every annual outer fold, its prior four calendar years use recent,
+fixed-duration inner validation windows at whole tournament-week boundaries.
+The validation windows do not overlap, and each inner training set expands only
+through earlier tournament weeks.
 `GridSearchCV` fits imputation, scaling, encoding, and the model separately in
 each inner training split, chooses the lowest inner log loss, refits on the
 outer training window, and finally scores the untouched outer year. The default
@@ -157,9 +161,11 @@ eight random-forest configurations. New models belong in the script's
 
 The script does not replace the step-06 or step-07 artifacts. It writes tuned
 latest-fold pipelines under `models/hyperparameter_tuning/` and an auditable
-JSON report, per-fold grid-result CSVs, and a comparison CSV under
-`reports/hyperparameter_tuning/`. A smaller smoke run is useful before the full
-search:
+JSON report, per-fold grid-result CSVs, out-of-fold prediction CSVs, fixed-bin
+calibration CSVs, interactive reliability plots, and a comparison CSV under
+`reports/hyperparameter_tuning/`. The calibration report includes expected and
+maximum calibration error, so a lower log loss is not mistaken for well-aligned
+probabilities. A smaller smoke run is useful before the full search:
 
 ```bash
 python step_08_hyperparameter_tuning.py \
@@ -167,6 +173,7 @@ python step_08_hyperparameter_tuning.py \
   --first-evaluation-year 2025 \
   --last-evaluation-year 2025 \
   --inner-splits 2 \
+  --inner-validation-weeks 13 \
   --n-jobs 1
 ```
 
@@ -197,8 +204,9 @@ compares it with the locally retained provider files, and appends only exact-new
 raw rows. Existing raw rows are never removed or replaced. It saves the prior,
 incoming, and merged provider files under `data/snapshots/daily_refresh/`, then
 rebuilds the canonical table and pre-match features. It does not overwrite a saved model artifact:
-each displayed prediction fits the configured logistic model in memory using a
-four-year history ending before the selected tournament week.
+each displayed prediction selects the lowest-log-loss tuned candidate, then
+fits that model in memory using a four-year history ending before the selected
+tournament week.
 
 Select two players and enter their official pre-match WTA singles rank and
 ranking points manually. The dashboard does not treat rank/point values from
@@ -206,6 +214,12 @@ match providers as official current rankings; a field left at `0` is unknown and
 is imputed by the model. Each forecast states that the ranking inputs were
 entered manually. The dashboard displays both complementary win
 probabilities—for example, `65%` and `35%`—rather than only a predicted winner.
+It also displays an approximate 95% calibrated win-rate confidence interval for each
+prediction. The interval uses the selected model's chronological out-of-fold
+forecasts with similar predicted probabilities, so it is comparable across
+logistic regression, random forest, and XGBoost. It is not a guaranteed range
+for the match result and does not account for injuries, withdrawals, or
+unrecorded changes in form.
 A `RR` round means round-robin group play. A loss does not eliminate a player
 in the interface, and the dashboard makes no elimination inference.
 

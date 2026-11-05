@@ -1,8 +1,9 @@
 """Nested chronological hyperparameter tuning for the WTA winner models.
 
 For every outer evaluation year, this script trains on only the immediately
-preceding calendar years.  Inside that outer training window, GridSearchCV uses
-expanding, tournament-week-aware validation splits to select hyperparameters.
+preceding calendar years. Inside that outer training window, GridSearchCV uses
+recent fixed-duration, tournament-week-aware validation splits to select
+hyperparameters.
 The outer year is never used to select a configuration.
 
 The default grids are intentionally small.  Extend MODEL_SPECS with another
@@ -13,7 +14,8 @@ Run from the project directory:
 
 For a quicker smoke run of logistic regression only:
     python step_08_hyperparameter_tuning.py --models logistic_regression \\
-        --first-evaluation-year 2025 --last-evaluation-year 2025 --inner-splits 2
+        --first-evaluation-year 2025 --last-evaluation-year 2025 --inner-splits 2 \\
+        --inner-validation-weeks 13
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -35,6 +38,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from xgboost import XGBClassifier
+
 
 from step_06_train_baseline_model import (
     CATEGORICAL_FEATURES,
@@ -53,6 +58,8 @@ DEFAULT_FIRST_EVALUATION_YEAR = 2020
 DEFAULT_LAST_EVALUATION_YEAR = 2025
 DEFAULT_TRAIN_WINDOW_YEARS = 4
 DEFAULT_INNER_SPLITS = 3
+DEFAULT_INNER_VALIDATION_WEEKS = 26
+DEFAULT_CALIBRATION_BINS = 10
 
 
 @dataclass(frozen=True)
@@ -135,7 +142,39 @@ def build_random_forest_pipeline() -> Pipeline:
         ]
     )
 
-
+def build_xgbost_pipeline() -> Pipeline:
+    """Return leakage-safe preprocessing plus a CPU-friendly XGBoost.
+    """
+    numeric_pipeline = Pipeline(
+        [("imputer", SimpleImputer(strategy="median", add_indicator=True))]
+    )
+    categorical_pipeline = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore")),
+        ]
+    )
+    return Pipeline(
+        [
+            (
+                "preprocessor",
+                ColumnTransformer(
+                    [
+                        ("numeric", numeric_pipeline, NUMERIC_FEATURES),
+                        ("categorical", categorical_pipeline, CATEGORICAL_FEATURES),
+                    ]
+                ),
+            ),
+            (
+                "classifier",
+                XGBClassifier(
+                    objective='binary:logistic',
+                    learning_rate=0.001,
+                    n_estimators=1000,
+                ),
+            ),
+        ]
+    )
 MODEL_SPECS: dict[str, ModelSpec] = {
     "logistic_regression": ModelSpec(
         name="logistic_regression",
@@ -154,6 +193,14 @@ MODEL_SPECS: dict[str, ModelSpec] = {
             "classifier__max_depth": [None, 12],
             "classifier__min_samples_leaf": [2, 5],
             "classifier__max_features": ["sqrt", 0.5],
+        },
+    ),
+    "xgboost": ModelSpec(
+        name="xgboost",
+        description="Nonlinear tree ensemble using the same explicit safe features.",
+        pipeline_builder=build_xgbost_pipeline,
+        param_grid={
+            "classifier__max_depth": [2, 3],
         },
     ),
 }
@@ -201,17 +248,20 @@ def annual_outer_fold(
     return training, evaluation
 
 
-def expanding_week_splits(
-    training: pd.DataFrame, inner_splits: int
+def rolling_week_splits(
+    training: pd.DataFrame, inner_splits: int, validation_weeks: int
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[dict[str, str]]]:
-    """Create expanding validation folds that never split a tournament week.
+    """Create recent fixed-duration validation folds without splitting tournament weeks.
 
-    The first contiguous date block seeds training.  Each later block is
-    validation, while training expands to all earlier tournament weeks.  The
-    returned positional indices are safe to pass directly to GridSearchCV.
+    Each validation fold covers the same calendar duration, ending with the
+    most recent available training week. Its fitting rows are strictly earlier
+    tournament weeks and expand through history. This avoids the uneven,
+    multi-season validation blocks produced by an equal-date-count split.
     """
     if inner_splits < 2:
         raise ValueError("--inner-splits must be at least 2.")
+    if validation_weeks < 1:
+        raise ValueError("--inner-validation-weeks must be at least 1.")
     unique_dates = pd.Index(training["match_date"].drop_duplicates().sort_values())
     if len(unique_dates) < inner_splits + 1:
         raise ValueError(
@@ -219,24 +269,24 @@ def expanding_week_splits(
             f"{inner_splits} inner splits; found {len(unique_dates)}."
         )
 
-    date_blocks = [
-        block for block in np.array_split(unique_dates.to_numpy(), inner_splits + 1) if len(block)
-    ]
-    if len(date_blocks) != inner_splits + 1:
-        raise ValueError("Unable to construct the requested non-empty inner time splits.")
-
     splits: list[tuple[np.ndarray, np.ndarray]] = []
     metadata: list[dict[str, str]] = []
     dates = training["match_date"]
-    for split_number, validation_dates in enumerate(date_blocks[1:], start=1):
-        validation_start = pd.Timestamp(validation_dates[0])
-        validation_end = pd.Timestamp(validation_dates[-1])
+    last_week_end = pd.Timestamp(unique_dates.max()) + pd.Timedelta(days=7)
+    validation_span = pd.Timedelta(weeks=validation_weeks)
+    for split_number in range(1, inner_splits + 1):
+        windows_remaining = inner_splits - split_number
+        validation_end_exclusive = last_week_end - validation_span * windows_remaining
+        validation_start = validation_end_exclusive - validation_span
         train_index = np.flatnonzero((dates < validation_start).to_numpy())
         validation_index = np.flatnonzero(
-            dates.between(validation_start, validation_end).to_numpy()
+            ((dates >= validation_start) & (dates < validation_end_exclusive)).to_numpy()
         )
         if not len(train_index) or not len(validation_index):
-            raise ValueError(f"Inner split {split_number} is unexpectedly empty.")
+            raise ValueError(
+                f"Inner split {split_number} is empty for a {validation_weeks}-week "
+                "validation window. Reduce --inner-splits or --inner-validation-weeks."
+            )
         if dates.iloc[train_index].max() >= dates.iloc[validation_index].min():
             raise ValueError(f"Inner split {split_number} is not strictly time ordered.")
         if training.iloc[train_index][TARGET_COLUMN].nunique() != 2:
@@ -251,9 +301,101 @@ def expanding_week_splits(
                 "training_end_date": dates.iloc[train_index].max().date().isoformat(),
                 "validation_start_date": dates.iloc[validation_index].min().date().isoformat(),
                 "validation_end_date": dates.iloc[validation_index].max().date().isoformat(),
+                "validation_weeks": str(validation_weeks),
             }
         )
     return splits, metadata
+
+
+def calibration_table(
+    predictions: pd.DataFrame, calibration_bins: int
+) -> tuple[pd.DataFrame, dict[str, float | int]]:
+    """Summarize observed outcomes against predicted probabilities by fixed bins."""
+    if calibration_bins < 2:
+        raise ValueError("--calibration-bins must be at least 2.")
+    probabilities = predictions["probability_player_a_wins"].astype(float)
+    outcomes = predictions["actual_player_a_won"].astype(float)
+    if probabilities.isna().any() or outcomes.isna().any():
+        raise ValueError("Out-of-fold predictions cannot contain missing values.")
+    edges = np.linspace(0.0, 1.0, calibration_bins + 1)
+    bin_codes = pd.cut(
+        probabilities, bins=edges, include_lowest=True, labels=False
+    ).astype("Int64")
+    rows: list[dict[str, float | int]] = []
+    for bin_number in range(calibration_bins):
+        in_bin = bin_codes.eq(bin_number)
+        count = int(in_bin.sum())
+        row: dict[str, float | int] = {
+            "bin": bin_number + 1,
+            "bin_lower": float(edges[bin_number]),
+            "bin_upper": float(edges[bin_number + 1]),
+            "match_count": count,
+            "mean_predicted_probability": np.nan,
+            "observed_win_rate": np.nan,
+            "absolute_calibration_gap": np.nan,
+        }
+        if count:
+            mean_prediction = float(probabilities.loc[in_bin].mean())
+            observed_rate = float(outcomes.loc[in_bin].mean())
+            row.update(
+                {
+                    "mean_predicted_probability": mean_prediction,
+                    "observed_win_rate": observed_rate,
+                    "absolute_calibration_gap": abs(mean_prediction - observed_rate),
+                }
+            )
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    non_empty = table.loc[table["match_count"].gt(0)]
+    expected_calibration_error = float(
+        (
+            non_empty["absolute_calibration_gap"] * non_empty["match_count"]
+        ).sum()
+        / len(predictions)
+    )
+    return table, {
+        "calibration_bins": calibration_bins,
+        "out_of_fold_predictions": int(len(predictions)),
+        "expected_calibration_error": round(expected_calibration_error, 6),
+        "maximum_calibration_error": round(
+            float(non_empty["absolute_calibration_gap"].max()), 6
+        ),
+    }
+
+
+def reliability_figure(calibration: pd.DataFrame, model_name: str) -> go.Figure:
+    """Create an interactive reliability diagram from non-empty calibration bins."""
+    visible_bins = calibration.loc[calibration["match_count"].gt(0)]
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=[0, 1], y=[0, 1], mode="lines", name="Perfect calibration",
+            line={"color": "#94a3b8", "dash": "dash"},
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=visible_bins["mean_predicted_probability"],
+            y=visible_bins["observed_win_rate"],
+            mode="lines+markers",
+            name="Out-of-fold predictions",
+            marker={"size": 9, "color": "#2563eb"},
+            customdata=visible_bins[["bin_lower", "bin_upper", "match_count"]],
+            hovertemplate=(
+                "Predicted: %{x:.1%}<br>Observed: %{y:.1%}<br>"
+                "Bin: %{customdata[0]:.0%}–%{customdata[1]:.0%}<br>"
+                "Matches: %{customdata[2]}<extra></extra>"
+            ),
+        )
+    )
+    figure.update_layout(
+        title=f"{model_name}: out-of-fold reliability",
+        xaxis={"title": "Mean predicted Player A win probability", "range": [0, 1], "tickformat": ".0%"},
+        yaxis={"title": "Observed Player A win rate", "range": [0, 1], "tickformat": ".0%"},
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.12},
+    )
+    return figure
 
 
 def json_default(value: object) -> object:
@@ -294,8 +436,10 @@ def nested_walk_forward_tuning(
     last_evaluation_year: int,
     train_window_years: int,
     inner_splits: int,
+    inner_validation_weeks: int,
+    calibration_bins: int,
     n_jobs: int,
-) -> tuple[dict[str, object], dict[str, object], pd.DataFrame]:
+) -> tuple[dict[str, object], dict[str, object], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Tune within each outer training fold, then score the untouched outer year."""
     if train_window_years < 1:
         raise ValueError("--train-window-years must be at least 1.")
@@ -316,7 +460,9 @@ def nested_walk_forward_tuning(
         training, evaluation = annual_outer_fold(
             features, evaluation_year, train_window_years
         )
-        inner_cv, inner_windows = expanding_week_splits(training, inner_splits)
+        inner_cv, inner_windows = rolling_week_splits(
+            training, inner_splits, inner_validation_weeks
+        )
         search = GridSearchCV(
             estimator=spec.pipeline_builder(),
             param_grid=spec.param_grid,
@@ -349,16 +495,25 @@ def nested_walk_forward_tuning(
         }
         fold_records.append(record)
         all_grid_results.append(grid_results_table(search, spec.name, evaluation_year))
-        all_predictions.append(
-            pd.DataFrame(
-                {
-                    "evaluation_year": evaluation_year,
-                    "match_date": evaluation["match_date"],
-                    "actual_player_a_won": evaluation[TARGET_COLUMN],
-                    "probability_player_a_wins": probability,
-                }
+        prediction_context_columns = [
+            column
+            for column in (
+                "match_date",
+                "feature_cutoff_date",
+                "tourney_name",
+                "player_a",
+                "player_b",
+                "surface",
+                "tourney_level",
+                "round",
             )
-        )
+            if column in evaluation.columns
+        ]
+        fold_predictions = evaluation[prediction_context_columns].copy()
+        fold_predictions.insert(0, "evaluation_year", evaluation_year)
+        fold_predictions["actual_player_a_won"] = evaluation[TARGET_COLUMN]
+        fold_predictions["probability_player_a_wins"] = probability
+        all_predictions.append(fold_predictions)
         latest_estimator = search.best_estimator_
         latest_record = record
         print(
@@ -374,6 +529,7 @@ def nested_walk_forward_tuning(
     overall_metrics = calculate_metrics(
         predictions["actual_player_a_won"], predictions["probability_player_a_wins"]
     )
+    calibration, calibration_summary = calibration_table(predictions, calibration_bins)
     fold_metrics = pd.DataFrame(fold_records)
     mean_fold_metrics = {
         metric: round(float(fold_metrics[metric].mean()), 6) for metric in overall_metrics
@@ -388,6 +544,8 @@ def nested_walk_forward_tuning(
         "purpose": "latest nested walk-forward fold; not a match-day production model",
         "training_window_years": train_window_years,
         "inner_splits": inner_splits,
+        "inner_validation_weeks": inner_validation_weeks,
+        "calibration_bins": calibration_bins,
         "evaluation_year": latest_record["evaluation_year"],
         "best_params": latest_record["best_params"],
         "training_start_date": latest_record["training_start_date"],
@@ -402,21 +560,29 @@ def nested_walk_forward_tuning(
         "feature_count": len(MODEL_FEATURES),
         "training_window_years": train_window_years,
         "inner_splits": inner_splits,
+        "inner_validation_weeks": inner_validation_weeks,
         "evaluation_years": list(range(first_evaluation_year, last_evaluation_year + 1)),
         "parameter_grid": spec.param_grid,
         "outer_folds": fold_records,
         "overall_out_of_sample_metrics": overall_metrics,
         "mean_fold_metrics": mean_fold_metrics,
+        "calibration": calibration_summary,
         "leakage_controls": [
             "Every feature uses only strictly earlier tournament weeks.",
             "Each outer evaluation year is held out from both fitting and hyperparameter selection.",
-            "Inner GridSearchCV folds expand strictly through earlier whole tournament weeks.",
+            "Inner GridSearchCV uses recent fixed-duration validation windows and expands strictly through earlier whole tournament weeks.",
             "Imputation, scaling, categorical encoding, and model fitting occur inside each inner training split.",
             "No current-match score, duration, serve statistic, winner/loser field, or weather field is a model input.",
             "2026 is excluded from tuning and evaluation.",
         ],
     }
-    return artifact, report, pd.concat(all_grid_results, ignore_index=True)
+    return (
+        artifact,
+        report,
+        pd.concat(all_grid_results, ignore_index=True),
+        predictions,
+        calibration,
+    )
 
 
 def write_model_outputs(
@@ -424,6 +590,8 @@ def write_model_outputs(
     artifact: dict[str, object],
     report: dict[str, object],
     grid_results: pd.DataFrame,
+    predictions: pd.DataFrame,
+    calibration: pd.DataFrame,
     spec: ModelSpec,
     models_dir: Path,
     reports_dir: Path,
@@ -435,12 +603,20 @@ def write_model_outputs(
         "model": models_dir / f"{spec.name}_nested_walk_forward_latest_fold.joblib",
         "report": reports_dir / f"{spec.name}_nested_walk_forward.json",
         "grid_results": reports_dir / f"{spec.name}_inner_grid_results.csv",
+        "predictions": reports_dir / f"{spec.name}_outer_fold_predictions.csv",
+        "calibration": reports_dir / f"{spec.name}_calibration.csv",
+        "reliability_plot": reports_dir / f"{spec.name}_reliability.html",
     }
     joblib.dump(artifact, paths["model"])
     paths["report"].write_text(
         json.dumps(report, indent=2, default=json_default), encoding="utf-8"
     )
     grid_results.to_csv(paths["grid_results"], index=False)
+    predictions.to_csv(paths["predictions"], index=False)
+    calibration.to_csv(paths["calibration"], index=False)
+    reliability_figure(calibration, spec.name).write_html(
+        paths["reliability_plot"], include_plotlyjs="cdn", full_html=True
+    )
     return paths
 
 
@@ -453,7 +629,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=sorted(MODEL_SPECS),
         default=sorted(MODEL_SPECS),
-        help="Models to tune (default: logistic_regression random_forest).",
+        help="Models to tune (default: all available models).",
     )
     parser.add_argument(
         "--first-evaluation-year", type=int, default=DEFAULT_FIRST_EVALUATION_YEAR
@@ -465,6 +641,24 @@ def parse_args() -> argparse.Namespace:
         "--train-window-years", type=int, default=DEFAULT_TRAIN_WINDOW_YEARS
     )
     parser.add_argument("--inner-splits", type=int, default=DEFAULT_INNER_SPLITS)
+    parser.add_argument(
+        "--inner-validation-weeks",
+        type=int,
+        default=DEFAULT_INNER_VALIDATION_WEEKS,
+        help=(
+            "Duration of each recent fixed inner validation window in weeks "
+            f"(default: {DEFAULT_INNER_VALIDATION_WEEKS})."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-bins",
+        type=int,
+        default=DEFAULT_CALIBRATION_BINS,
+        help=(
+            "Number of fixed probability bins for the out-of-fold reliability "
+            f"report (default: {DEFAULT_CALIBRATION_BINS})."
+        ),
+    )
     parser.add_argument(
         "--n-jobs",
         type=int,
@@ -485,19 +679,23 @@ def main() -> int:
 
     for model_name in args.models:
         spec = MODEL_SPECS[model_name]
-        artifact, report, grid_results = nested_walk_forward_tuning(
+        artifact, report, grid_results, predictions, calibration = nested_walk_forward_tuning(
             features,
             spec,
             first_evaluation_year=args.first_evaluation_year,
             last_evaluation_year=args.last_evaluation_year,
             train_window_years=args.train_window_years,
             inner_splits=args.inner_splits,
+            inner_validation_weeks=args.inner_validation_weeks,
+            calibration_bins=args.calibration_bins,
             n_jobs=args.n_jobs,
         )
         paths = write_model_outputs(
             artifact=artifact,
             report=report,
             grid_results=grid_results,
+            predictions=predictions,
+            calibration=calibration,
             spec=spec,
             models_dir=args.models_dir,
             reports_dir=args.reports_dir,
@@ -505,6 +703,9 @@ def main() -> int:
         print(f"Wrote {model_name} model artifact to {paths['model']}")
         print(f"Wrote {model_name} tuning report to {paths['report']}")
         print(f"Wrote {model_name} grid results to {paths['grid_results']}")
+        print(f"Wrote {model_name} out-of-fold predictions to {paths['predictions']}")
+        print(f"Wrote {model_name} calibration table to {paths['calibration']}")
+        print(f"Wrote {model_name} reliability plot to {paths['reliability_plot']}")
         comparison_rows.append(
             {
                 "model": model_name,

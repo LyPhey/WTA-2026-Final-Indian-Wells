@@ -2407,13 +2407,30 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
             else:
                 probability_one = prediction["player_one_probability"]
                 probability_two = prediction["player_two_probability"]
+                interval_one_lower, interval_one_upper = prediction[
+                    "player_one_probability_interval"
+                ]
+                interval_two_lower, interval_two_upper = prediction[
+                    "player_two_probability_interval"
+                ]
+                interval_confidence_level = prediction[
+                    "probability_interval_confidence_level"
+                ]
                 st.markdown("#### Forecast")
                 with st.container(border=True):
                     one, label, two = st.columns([4, 2, 4])
                     one.metric(player_one, f"{probability_one:.1%}")
+                    one.caption(
+                        f"{interval_confidence_level:.0%} confidence interval (calibrated): "
+                        f"{interval_one_lower:.1%}–{interval_one_upper:.1%}"
+                    )
                     with label:
                         st.markdown('<div class="live-versus">WIN PROBABILITY</div>', unsafe_allow_html=True)
                     two.metric(player_two, f"{probability_two:.1%}")
+                    two.caption(
+                        f"{interval_confidence_level:.0%} confidence interval (calibrated): "
+                        f"{interval_two_lower:.1%}–{interval_two_upper:.1%}"
+                    )
                     st.progress(
                         probability_one,
                         text=(
@@ -2422,6 +2439,11 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
                         ),
                     )
                     st.caption("The probabilities are complementary and sum to 100%.")
+                    st.caption(
+                        f"The {interval_confidence_level:.0%} confidence intervals use historical, "
+                        "out-of-fold forecasts from the selected model with similar predicted "
+                        "probabilities. They are not a guarantee or a player's chance of winning."
+                    )
                     st.caption(
                         "Forecast context: "
                         f"{tournament_category} · {selected_round_label} · {selected_surface}. "
@@ -2446,6 +2468,19 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
                         "Ranking provenance: only values entered in this forecast form were used. "
                         "Fields left at 0 were treated as unknown. No ranking or point value was "
                         "taken from local match records."
+                    )
+                    st.write(
+                        f"Model selection: {prediction['model_name']} was selected by the "
+                        f"lowest chronological outer-fold log loss "
+                        f"({prediction['model_selection_log_loss']:.3f})."
+                    )
+                    st.write(
+                        f"Uncertainty method: approximate {interval_confidence_level:.0%} "
+                        "Wilson interval from "
+                        f"{prediction['calibration_neighbor_count']:,} historical out-of-fold "
+                        "forecasts with similar predicted probabilities. It reflects calibration "
+                        "and finite historical evidence; injuries, withdrawals, unrecorded form, "
+                        "and changes in competition are not included."
                     )
 
     with st.expander("Pre-match safeguards"):

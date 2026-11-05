@@ -16,8 +16,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import shutil
 from pathlib import Path
+from statistics import NormalDist
 import subprocess
 import sys
 from typing import Any
@@ -31,7 +33,7 @@ from step_05_build_pre_match_features import (
     normalized_player_key,
 )
 from step_06_train_baseline_model import MODEL_FEATURES, TARGET_COLUMN, validate_input
-from step_08_hyperparameter_tuning import build_logistic_regression_pipeline
+from step_08_hyperparameter_tuning import MODEL_SPECS
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -44,11 +46,11 @@ SNAPSHOT_ROOT = PROJECT_DIR / "data/snapshots/daily_refresh"
 HISTORY_START_YEAR = 2016
 HISTORY_END_YEAR = 2026
 LIVE_TRAINING_WINDOW_YEARS = 4
-LIVE_LOGISTIC_PARAMS = {
-    "classifier__C": 0.1,
-    "classifier__class_weight": None,
-}
+LIVE_PROBABILITY_INTERVAL_CONFIDENCE_LEVEL = 0.95
+LIVE_CALIBRATION_NEIGHBOR_COUNT = 400
 PREDICTION_TOURNAMENT_NAME = "Live WTA Finals prediction"
+TUNING_REPORTS_DIR = PROJECT_DIR / "reports/hyperparameter_tuning"
+MODEL_COMPARISON_PATH = TUNING_REPORTS_DIR / "nested_walk_forward_model_comparison.csv"
 
 
 @dataclass(frozen=True)
@@ -365,11 +367,11 @@ def _build_prediction_feature_row(
     return prediction[MODEL_FEATURES], player_a, player_b
 
 
-def _fit_live_logistic_model(
+def _fit_live_model(
     feature_path: Path,
     tournament_week_start: object,
 ) -> tuple[Pipeline, dict[str, Any]]:
-    """Fit the selected logistic configuration only through the safe cutoff."""
+    """Fit the best backtested candidate only through the safe cutoff."""
     if not feature_path.is_file():
         raise FileNotFoundError(
             f"Feature table is missing: {feature_path}. Run step_05_build_pre_match_features.py first."
@@ -384,13 +386,116 @@ def _fit_live_logistic_model(
         raise ValueError("No historical feature rows are available before this tournament week.")
     if training[TARGET_COLUMN].nunique() != 2:
         raise ValueError("The live training window does not contain both outcome classes.")
-    pipeline = build_logistic_regression_pipeline().set_params(**LIVE_LOGISTIC_PARAMS)
+    model_name, model_params, selection_log_loss = _select_live_model()
+    pipeline = MODEL_SPECS[model_name].pipeline_builder().set_params(**model_params)
     pipeline.fit(training[MODEL_FEATURES], training[TARGET_COLUMN])
     return pipeline, {
         "training_rows": int(len(training)),
         "training_start_date": training["match_date"].min().date().isoformat(),
         "training_end_date": training["match_date"].max().date().isoformat(),
         "feature_version": training["feature_version"].iloc[0],
+        "model": f"live_{model_name}_selected_by_outer_log_loss",
+        "model_name": model_name,
+        "model_params": model_params,
+        "model_selection_log_loss": selection_log_loss,
+        "model_selection_method": "lowest chronological outer-fold log loss",
+    }
+
+
+def _select_live_model() -> tuple[str, dict[str, Any], float]:
+    """Choose the lowest-log-loss tuned model with auditable interval evidence."""
+    if not MODEL_COMPARISON_PATH.is_file():
+        raise FileNotFoundError(
+            "Model comparison is missing. Run step_08_hyperparameter_tuning.py before "
+            "creating live predictions."
+        )
+    comparison = pd.read_csv(MODEL_COMPARISON_PATH)
+    required_columns = {"model", "log_loss"}
+    if missing := sorted(required_columns - set(comparison.columns)):
+        raise ValueError(f"Model comparison is missing required columns: {missing}")
+    comparison["log_loss"] = pd.to_numeric(comparison["log_loss"], errors="coerce")
+    eligible = comparison.loc[
+        comparison["model"].isin(MODEL_SPECS) & comparison["log_loss"].notna()
+    ].sort_values("log_loss", kind="stable")
+    if eligible.empty:
+        raise ValueError("No tuned live-prediction model is available in the comparison report.")
+
+    model_name = str(eligible.iloc[0]["model"])
+    report_path = TUNING_REPORTS_DIR / f"{model_name}_nested_walk_forward.json"
+    predictions_path = TUNING_REPORTS_DIR / f"{model_name}_outer_fold_predictions.csv"
+    if not report_path.is_file() or not predictions_path.is_file():
+        raise FileNotFoundError(
+            f"Live prediction needs {report_path.name} and {predictions_path.name}. "
+            "Run step_08_hyperparameter_tuning.py to create current tuning and "
+            "out-of-fold calibration outputs."
+        )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    outer_folds = report.get("outer_folds", [])
+    if not outer_folds:
+        raise ValueError(f"The tuning report for {model_name} has no outer folds.")
+    latest_fold = max(outer_folds, key=lambda fold: int(fold["evaluation_year"]))
+    model_params = latest_fold.get("best_params")
+    if not isinstance(model_params, dict):
+        raise ValueError(f"The tuning report for {model_name} has no selected parameters.")
+    return model_name, model_params, float(eligible.iloc[0]["log_loss"])
+
+
+def _calibrated_probability_interval(
+    probability: float,
+    model_name: str,
+    *,
+    confidence_level: float = LIVE_PROBABILITY_INTERVAL_CONFIDENCE_LEVEL,
+    neighbor_count: int = LIVE_CALIBRATION_NEIGHBOR_COUNT,
+) -> tuple[float, float, dict[str, float | int]]:
+    """Return a model-agnostic Wilson interval from nearby out-of-fold forecasts."""
+    if not 0.0 < confidence_level < 1.0:
+        raise ValueError("The probability-interval confidence level must be between 0 and 1.")
+    if neighbor_count < 1:
+        raise ValueError("The calibration-neighbor count must be at least 1.")
+    predictions_path = TUNING_REPORTS_DIR / f"{model_name}_outer_fold_predictions.csv"
+    if not predictions_path.is_file():
+        raise FileNotFoundError(
+            f"Out-of-fold predictions are missing for {model_name}. Run "
+            "step_08_hyperparameter_tuning.py to create them."
+        )
+    historical = pd.read_csv(
+        predictions_path,
+        usecols=["actual_player_a_won", "probability_player_a_wins"],
+    )
+    historical["actual_player_a_won"] = pd.to_numeric(
+        historical["actual_player_a_won"], errors="coerce"
+    )
+    historical["probability_player_a_wins"] = pd.to_numeric(
+        historical["probability_player_a_wins"], errors="coerce"
+    )
+    historical = historical.loc[
+        historical["actual_player_a_won"].isin([0, 1])
+        & historical["probability_player_a_wins"].between(0.0, 1.0)
+    ].copy()
+    if historical.empty:
+        raise ValueError(f"Out-of-fold predictions for {model_name} contain no valid outcomes.")
+    historical["probability_distance"] = (
+        historical["probability_player_a_wins"] - probability
+    ).abs()
+    neighborhood = historical.nsmallest(neighbor_count, "probability_distance")
+    sample_size = len(neighborhood)
+    observed_rate = float(neighborhood["actual_player_a_won"].mean())
+    z_score = NormalDist().inv_cdf((1.0 + confidence_level) / 2.0)
+    denominator = 1.0 + (z_score**2 / sample_size)
+    center = (observed_rate + z_score**2 / (2.0 * sample_size)) / denominator
+    half_width = z_score * np.sqrt(
+        (observed_rate * (1.0 - observed_rate) + z_score**2 / (4.0 * sample_size))
+        / sample_size
+    ) / denominator
+    return float(center - half_width), float(center + half_width), {
+        "calibration_neighbor_count": sample_size,
+        "calibration_observed_win_rate": observed_rate,
+        "calibration_min_probability": float(
+            neighborhood["probability_player_a_wins"].min()
+        ),
+        "calibration_max_probability": float(
+            neighborhood["probability_player_a_wins"].max()
+        ),
     }
 
 
@@ -423,12 +528,20 @@ def predict_live_match(
         player_one_rank_points=player_one_rank_points,
         player_two_rank_points=player_two_rank_points,
     )
-    pipeline, training_metadata = _fit_live_logistic_model(
+    pipeline, training_metadata = _fit_live_model(
         feature_path, tournament_week_start
     )
     probability_a = float(pipeline.predict_proba(feature_row)[0, 1])
+    lower_a, upper_a, interval_metadata = _calibrated_probability_interval(
+        probability_a, training_metadata["model_name"]
+    )
     probability_one = probability_a if player_one == player_a else 1.0 - probability_a
     probability_two = 1.0 - probability_one
+    if player_one == player_a:
+        lower_one, upper_one = lower_a, upper_a
+    else:
+        lower_one, upper_one = 1.0 - upper_a, 1.0 - lower_a
+    lower_two, upper_two = 1.0 - upper_one, 1.0 - lower_one
     if not np.isclose(probability_one + probability_two, 1.0):
         raise RuntimeError("Live probabilities do not sum to one.")
     return {
@@ -436,13 +549,16 @@ def predict_live_match(
         "player_two": player_two,
         "player_one_probability": probability_one,
         "player_two_probability": probability_two,
+        "player_one_probability_interval": (lower_one, upper_one),
+        "player_two_probability_interval": (lower_two, upper_two),
+        "probability_interval_confidence_level": LIVE_PROBABILITY_INTERVAL_CONFIDENCE_LEVEL,
+        "probability_interval_method": "nearest_out_of_fold_calibration_wilson",
         "internal_player_a": player_a,
         "internal_player_b": player_b,
         "tournament_week_start": pd.Timestamp(tournament_week_start).date().isoformat(),
         "surface": surface,
         "tourney_level": tourney_level,
         "round": round_name,
-        "model": "live_logistic_regression_tuned_v1",
-        "model_params": LIVE_LOGISTIC_PARAMS,
         **training_metadata,
+        **interval_metadata,
     }
