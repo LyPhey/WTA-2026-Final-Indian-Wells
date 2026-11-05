@@ -35,7 +35,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from xgboost import XGBClassifier
@@ -60,6 +60,7 @@ DEFAULT_TRAIN_WINDOW_YEARS = 4
 DEFAULT_INNER_SPLITS = 3
 DEFAULT_INNER_VALIDATION_WEEKS = 26
 DEFAULT_CALIBRATION_BINS = 10
+DEFAULT_XGBOOST_RANDOM_SEARCH_ITERATIONS = 40
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class ModelSpec:
     description: str
     pipeline_builder: Callable[[], Pipeline]
     param_grid: dict[str, list[Any]]
+    search_method: str = "grid"
 
 
 def build_logistic_regression_pipeline() -> Pipeline:
@@ -168,9 +170,11 @@ def build_xgbost_pipeline() -> Pipeline:
             (
                 "classifier",
                 XGBClassifier(
-                    objective='binary:logistic',
+                    objective="binary:logistic",
                     learning_rate=0.001,
                     n_estimators=1000,
+                    n_jobs=1,
+                    random_state=42,
                 ),
             ),
         ]
@@ -181,7 +185,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         description="Regularized linear probability baseline using step-06 features.",
         pipeline_builder=build_logistic_regression_pipeline,
         param_grid={
-            "classifier__C": [0.1, 1.0, 10.0],
+            "classifier__C": [0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
             "classifier__class_weight": [None, "balanced"],
         },
     ),
@@ -190,9 +194,12 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         description="Nonlinear tree ensemble using the same explicit safe features.",
         pipeline_builder=build_random_forest_pipeline,
         param_grid={
-            "classifier__max_depth": [None, 12],
-            "classifier__min_samples_leaf": [2, 5],
+            "classifier__n_estimators": [300, 500, 800],
+            "classifier__max_depth": [None, 10, 16],
+            "classifier__min_samples_split": [2, 10],
+            "classifier__min_samples_leaf": [2, 5, 10],
             "classifier__max_features": ["sqrt", 0.5],
+            "classifier__class_weight": [None, "balanced"],
         },
     ),
     "xgboost": ModelSpec(
@@ -200,8 +207,16 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         description="Nonlinear tree ensemble using the same explicit safe features.",
         pipeline_builder=build_xgbost_pipeline,
         param_grid={
-            "classifier__max_depth": [2, 3],
+            "classifier__n_estimators": [300, 600, 1000],
+            "classifier__learning_rate": [0.02, 0.05, 0.1],
+            "classifier__max_depth": [2, 3, 4],
+            "classifier__min_child_weight": [1, 5, 10],
+            "classifier__subsample": [0.3, 0.5, 0.7, 0.9, 1.0],
+            "classifier__colsample_bytree": [0.7, 0.9, 1.0],
+            "classifier__reg_alpha": [0.0, 0.1, 0.5],
+            "classifier__reg_lambda": [1.0, 5.0, 10.0],
         },
+        search_method="random",
     ),
 }
 
@@ -405,10 +420,27 @@ def json_default(value: object) -> object:
     raise TypeError(f"Cannot serialize {type(value).__name__} to JSON.")
 
 
+def validate_model_spec(spec: ModelSpec) -> None:
+    """Fail before fitting if a candidate grid does not match its pipeline."""
+    if spec.search_method not in {"grid", "random"}:
+        raise ValueError(
+            f"{spec.name} has unsupported search method {spec.search_method!r}."
+        )
+    valid_parameters = set(spec.pipeline_builder().get_params(deep=True))
+    invalid_parameters = sorted(set(spec.param_grid) - valid_parameters)
+    if invalid_parameters:
+        raise ValueError(
+            f"{spec.name} has invalid pipeline parameter names: {invalid_parameters}. "
+            "Use '<pipeline_step>__<estimator_parameter>', for example "
+            "'classifier__n_estimators'."
+        )
+
+
 def grid_results_table(
-    search: GridSearchCV,
+    search: Any,
     model_name: str,
     evaluation_year: int,
+    search_method: str,
 ) -> pd.DataFrame:
     """Make GridSearchCV's useful results easy to inspect in a CSV."""
     results = pd.DataFrame(search.cv_results_)
@@ -416,9 +448,13 @@ def grid_results_table(
         {
             "model": model_name,
             "evaluation_year": evaluation_year,
-            "candidate_rank": results["rank_test_score"].astype(int),
-            "mean_inner_log_loss": -results["mean_test_score"],
-            "std_inner_log_loss": results["std_test_score"],
+            "search_method": search_method,
+            "candidate_rank": results["rank_test_log_loss"].astype(int),
+            "mean_inner_log_loss": -results["mean_test_log_loss"],
+            "std_inner_log_loss": results["std_test_log_loss"],
+            "mean_inner_accuracy": results["mean_test_accuracy"],
+            "std_inner_accuracy": results["std_test_accuracy"],
+            "mean_inner_brier_score": -results["mean_test_brier_score"],
             "mean_fit_seconds": results["mean_fit_time"],
             "parameters": results["params"].map(
                 lambda params: json.dumps(params, sort_keys=True, default=json_default)
@@ -426,6 +462,52 @@ def grid_results_table(
         }
     )
     return table.sort_values(["candidate_rank", "mean_inner_log_loss"]).reset_index(drop=True)
+
+
+def candidate_scatter_figure(grid_results: pd.DataFrame, model_name: str) -> go.Figure:
+    """Plot every inner-CV parameter candidate by log loss and accuracy."""
+    figure = go.Figure()
+    for evaluation_year, candidates in grid_results.groupby("evaluation_year", sort=True):
+        figure.add_trace(
+            go.Scatter(
+                x=candidates["mean_inner_log_loss"],
+                y=candidates["mean_inner_accuracy"],
+                mode="markers",
+                name=str(evaluation_year),
+                marker={"size": 10, "opacity": 0.82},
+                customdata=candidates[
+                    [
+                        "candidate_rank",
+                        "std_inner_log_loss",
+                        "mean_inner_brier_score",
+                        "mean_fit_seconds",
+                        "parameters",
+                    ]
+                ].to_numpy(),
+                hovertemplate=(
+                    "Outer evaluation year: " + str(evaluation_year)
+                    + "<br>Inner log loss: %{x:.4f}"
+                    + "<br>Inner accuracy: %{y:.2%}"
+                    + "<br>Candidate rank: %{customdata[0]}"
+                    + "<br>Log-loss standard deviation: %{customdata[1]:.4f}"
+                    + "<br>Inner Brier score: %{customdata[2]:.4f}"
+                    + "<br>Mean fit time: %{customdata[3]:.1f}s"
+                    + "<br>Parameters: %{customdata[4]}<extra></extra>"
+                ),
+            )
+        )
+    figure.update_layout(
+        title=(
+            f"{model_name}: {grid_results['search_method'].iloc[0]}-search candidates"
+        ),
+        xaxis={"title": "Mean inner log loss (lower is better)"},
+        yaxis={"title": "Mean inner accuracy (higher is better)", "tickformat": ".0%"},
+        legend={"title": "Outer evaluation year", "orientation": "h", "y": 1.12},
+        template="plotly_white",
+    )
+    return figure
+
+
 
 
 def nested_walk_forward_tuning(
@@ -438,6 +520,7 @@ def nested_walk_forward_tuning(
     inner_splits: int,
     inner_validation_weeks: int,
     calibration_bins: int,
+    xgboost_random_iterations: int,
     n_jobs: int,
 ) -> tuple[dict[str, object], dict[str, object], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Tune within each outer training fold, then score the untouched outer year."""
@@ -449,6 +532,9 @@ def nested_walk_forward_tuning(
         raise ValueError("Keep 2026 out of tuning and evaluation.")
     if n_jobs == 0:
         raise ValueError("--n-jobs cannot be zero; use -1 for all available cores.")
+    if xgboost_random_iterations < 1:
+        raise ValueError("--xgboost-random-iterations must be at least 1.")
+    validate_model_spec(spec)
 
     fold_records: list[dict[str, object]] = []
     all_grid_results: list[pd.DataFrame] = []
@@ -463,16 +549,28 @@ def nested_walk_forward_tuning(
         inner_cv, inner_windows = rolling_week_splits(
             training, inner_splits, inner_validation_weeks
         )
-        search = GridSearchCV(
-            estimator=spec.pipeline_builder(),
-            param_grid=spec.param_grid,
-            scoring="neg_log_loss",
-            cv=inner_cv,
-            n_jobs=n_jobs,
-            refit=True,
-            return_train_score=False,
-            error_score="raise",
-        )
+        search_options = {
+            "estimator": spec.pipeline_builder(),
+            "scoring": {
+                "log_loss": "neg_log_loss",
+                "accuracy": "accuracy",
+                "brier_score": "neg_brier_score",
+            },
+            "refit": "log_loss",
+            "cv": inner_cv,
+            "n_jobs": n_jobs,
+            "return_train_score": False,
+            "error_score": "raise",
+        }
+        if spec.search_method == "random":
+            search = RandomizedSearchCV(
+                param_distributions=spec.param_grid,
+                n_iter=xgboost_random_iterations,
+                random_state=42,
+                **search_options,
+            )
+        else:
+            search = GridSearchCV(param_grid=spec.param_grid, **search_options)
         search.fit(training[MODEL_FEATURES], training[TARGET_COLUMN])
         probability = pd.Series(
             search.predict_proba(evaluation[MODEL_FEATURES])[:, 1],
@@ -494,7 +592,9 @@ def nested_walk_forward_tuning(
             **metrics,
         }
         fold_records.append(record)
-        all_grid_results.append(grid_results_table(search, spec.name, evaluation_year))
+        all_grid_results.append(
+            grid_results_table(search, spec.name, evaluation_year, spec.search_method)
+        )
         prediction_context_columns = [
             column
             for column in (
@@ -603,6 +703,7 @@ def write_model_outputs(
         "model": models_dir / f"{spec.name}_nested_walk_forward_latest_fold.joblib",
         "report": reports_dir / f"{spec.name}_nested_walk_forward.json",
         "grid_results": reports_dir / f"{spec.name}_inner_grid_results.csv",
+        "candidate_scatter": reports_dir / f"{spec.name}_candidate_scatter.html",
         "predictions": reports_dir / f"{spec.name}_outer_fold_predictions.csv",
         "calibration": reports_dir / f"{spec.name}_calibration.csv",
         "reliability_plot": reports_dir / f"{spec.name}_reliability.html",
@@ -612,6 +713,9 @@ def write_model_outputs(
         json.dumps(report, indent=2, default=json_default), encoding="utf-8"
     )
     grid_results.to_csv(paths["grid_results"], index=False)
+    candidate_scatter_figure(grid_results, spec.name).write_html(
+        paths["candidate_scatter"], include_plotlyjs="cdn", full_html=True
+    )
     predictions.to_csv(paths["predictions"], index=False)
     calibration.to_csv(paths["calibration"], index=False)
     reliability_figure(calibration, spec.name).write_html(
@@ -660,6 +764,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--xgboost-random-iterations",
+        type=int,
+        default=DEFAULT_XGBOOST_RANDOM_SEARCH_ITERATIONS,
+        help=(
+            "Number of sampled XGBoost parameter combinations per outer fold "
+            f"(default: {DEFAULT_XGBOOST_RANDOM_SEARCH_ITERATIONS})."
+        ),
+    )
+    parser.add_argument(
         "--n-jobs",
         type=int,
         default=-1,
@@ -688,6 +801,7 @@ def main() -> int:
             inner_splits=args.inner_splits,
             inner_validation_weeks=args.inner_validation_weeks,
             calibration_bins=args.calibration_bins,
+            xgboost_random_iterations=args.xgboost_random_iterations,
             n_jobs=args.n_jobs,
         )
         paths = write_model_outputs(
@@ -703,6 +817,7 @@ def main() -> int:
         print(f"Wrote {model_name} model artifact to {paths['model']}")
         print(f"Wrote {model_name} tuning report to {paths['report']}")
         print(f"Wrote {model_name} grid results to {paths['grid_results']}")
+        print(f"Wrote {model_name} candidate scatter plot to {paths['candidate_scatter']}")
         print(f"Wrote {model_name} out-of-fold predictions to {paths['predictions']}")
         print(f"Wrote {model_name} calibration table to {paths['calibration']}")
         print(f"Wrote {model_name} reliability plot to {paths['reliability_plot']}")

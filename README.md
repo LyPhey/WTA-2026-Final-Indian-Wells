@@ -155,14 +155,17 @@ through earlier tournament weeks.
 `GridSearchCV` fits imputation, scaling, encoding, and the model separately in
 each inner training split, chooses the lowest inner log loss, refits on the
 outer training window, and finally scores the untouched outer year. The default
-grids are intentionally bounded: six logistic-regression configurations and
-eight random-forest configurations. New models belong in the script's
+grids are intentionally bounded: twelve logistic-regression configurations and
+a 216-configuration random-forest grid. XGBoost uses `RandomizedSearchCV` to sample
+40 combinations per outer fold rather than evaluating its large full grid. New
+models belong in the script's
 `MODEL_SPECS` registry, with their own pipeline builder and parameter grid.
 
 The script does not replace the step-06 or step-07 artifacts. It writes tuned
 latest-fold pipelines under `models/hyperparameter_tuning/` and an auditable
 JSON report, per-fold grid-result CSVs, out-of-fold prediction CSVs, fixed-bin
-calibration CSVs, interactive reliability plots, and a comparison CSV under
+calibration CSVs, interactive reliability plots, per-candidate log-loss versus
+accuracy scatter plots, and a comparison CSV under
 `reports/hyperparameter_tuning/`. The calibration report includes expected and
 maximum calibration error, so a lower log loss is not mistaken for well-aligned
 probabilities. A smaller smoke run is useful before the full search:
@@ -176,6 +179,22 @@ python step_08_hyperparameter_tuning.py \
   --inner-validation-weeks 13 \
   --n-jobs 1
 ```
+
+### Final model choice
+
+After one or more Step 08 runs, use `step_09_final_model_choice.py` to create
+a read-only final-selection report:
+
+```bash
+python step_09_final_model_choice.py
+```
+
+Open `reports/final_model_choice/final_model_choice.html`. It compares every
+available individual Step 08 report by held-out log loss, Brier score, accuracy,
+and ROC AUC; overlays their reliability curves; and shows each available
+candidate log-loss-versus-accuracy tradeoff. If a prior Step 08 report was made
+before the multi-metric candidate results were added, Step 09 tells you exactly
+which model should be rerun before deciding.
 
 On some networks TennisMyLife may block scripted CSV access; if you encounter an error, open https://stats.tennismylife.org/tennis-match-database and download WTA years manually into `data/raw/tennismylife/`. TennisData.App CSVs may similarly need manual browser downloads, saved separately to `data/raw/tennisdata_app/` (which this downloader intentionally does not scrape).
 
