@@ -152,12 +152,12 @@ For every annual outer fold, its prior four calendar years use recent,
 fixed-duration inner validation windows at whole tournament-week boundaries.
 The validation windows do not overlap, and each inner training set expands only
 through earlier tournament weeks.
-`GridSearchCV` fits imputation, scaling, encoding, and the model separately in
-each inner training split, chooses the lowest inner log loss, refits on the
+The tuning search fits imputation, scaling, encoding, and the model separately
+in each inner training split, chooses the lowest inner log loss, refits on the
 outer training window, and finally scores the untouched outer year. The default
 grids are intentionally bounded: twelve logistic-regression configurations and
 a 216-configuration random-forest grid. XGBoost uses `RandomizedSearchCV` to sample
-40 combinations per outer fold rather than evaluating its large full grid. New
+60 combinations per outer fold rather than evaluating its large full grid. New
 models belong in the script's
 `MODEL_SPECS` registry, with their own pipeline builder and parameter grid.
 
@@ -195,6 +195,22 @@ and ROC AUC; overlays their reliability curves; and shows each available
 candidate log-loss-versus-accuracy tradeoff. If a prior Step 08 report was made
 before the multi-metric candidate results were added, Step 09 tells you exactly
 which model should be rerun before deciding.
+
+### Feature importance
+
+Use `step_10_feature_importance.py` only after Step 08 has produced tuning
+reports. It selects the lowest-log-loss available finalist by default, refits it
+in each historical outer fold, and measures held-out permutation importance with
+log loss as the scoring metric:
+
+```bash
+python step_10_feature_importance.py
+```
+
+The report is written under `reports/feature_importance/`. It includes
+individual feature importance, grouped importance for correlated feature
+families, a Plotly HTML chart, and metadata. It does not remove features:
+validate any proposed removal through a new chronological ablation run.
 
 On some networks TennisMyLife may block scripted CSV access; if you encounter an error, open https://stats.tennismylife.org/tennis-match-database and download WTA years manually into `data/raw/tennismylife/`. TennisData.App CSVs may similarly need manual browser downloads, saved separately to `data/raw/tennisdata_app/` (which this downloader intentionally does not scrape).
 

@@ -60,7 +60,7 @@ DEFAULT_TRAIN_WINDOW_YEARS = 4
 DEFAULT_INNER_SPLITS = 3
 DEFAULT_INNER_VALIDATION_WEEKS = 26
 DEFAULT_CALIBRATION_BINS = 10
-DEFAULT_XGBOOST_RANDOM_SEARCH_ITERATIONS = 40
+DEFAULT_XGBOOST_RANDOM_SEARCH_ITERATIONS = 60
 
 
 @dataclass(frozen=True)
@@ -145,8 +145,7 @@ def build_random_forest_pipeline() -> Pipeline:
     )
 
 def build_xgbost_pipeline() -> Pipeline:
-    """Return leakage-safe preprocessing plus a CPU-friendly XGBoost.
-    """
+    """Return leakage-safe preprocessing plus a CPU-friendly XGBoost."""
     numeric_pipeline = Pipeline(
         [("imputer", SimpleImputer(strategy="median", add_indicator=True))]
     )
@@ -171,10 +170,13 @@ def build_xgbost_pipeline() -> Pipeline:
                 "classifier",
                 XGBClassifier(
                     objective="binary:logistic",
-                    learning_rate=0.001,
-                    n_estimators=1000,
+                    eval_metric="logloss",
+                    tree_method="hist",
+                    learning_rate=0.05,
+                    n_estimators=600,
                     n_jobs=1,
                     random_state=42,
+                    verbosity=0,
                 ),
             ),
         ]
@@ -207,14 +209,15 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         description="Nonlinear tree ensemble using the same explicit safe features.",
         pipeline_builder=build_xgbost_pipeline,
         param_grid={
-            "classifier__n_estimators": [300, 600, 1000],
-            "classifier__learning_rate": [0.02, 0.05, 0.1],
+            "classifier__n_estimators": [300, 500, 800, 1_100],
+            "classifier__learning_rate": [0.02, 0.04, 0.07, 0.1],
             "classifier__max_depth": [2, 3, 4],
-            "classifier__min_child_weight": [1, 5, 10],
-            "classifier__subsample": [0.3, 0.5, 0.7, 0.9, 1.0],
-            "classifier__colsample_bytree": [0.7, 0.9, 1.0],
-            "classifier__reg_alpha": [0.0, 0.1, 0.5],
-            "classifier__reg_lambda": [1.0, 5.0, 10.0],
+            "classifier__min_child_weight": [1, 3, 5, 10],
+            "classifier__gamma": [0.0, 0.1, 0.5],
+            "classifier__subsample": [0.6, 0.8, 1.0],
+            "classifier__colsample_bytree": [0.6, 0.8, 1.0],
+            "classifier__reg_alpha": [0.0, 0.01, 0.1, 0.5],
+            "classifier__reg_lambda": [1.0, 3.0, 5.0, 10.0],
         },
         search_method="random",
     ),
