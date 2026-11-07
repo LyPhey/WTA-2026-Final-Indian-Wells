@@ -1,9 +1,12 @@
 """Build time-aware, leakage-safe WTA pre-match features.
 
 The source files only supply tournament-week dates, not dependable match dates
-or start times. Every row therefore uses only completed results from strictly
-earlier tournament weeks. Within a week, all player histories and Elo ratings
-are frozen until every result in that week has been processed.
+or start times. Every row without a verified completion timestamp therefore
+uses only completed results from strictly earlier tournament weeks. Within such
+a week, all player histories and Elo ratings are frozen until every result in
+that week has been processed. Dashboard feedback may provide a verified
+``match_completed_at_utc`` timestamp; those results become available only to
+later timestamped live predictions.
 
 Run from the project directory:
     python step_05_build_pre_match_features.py
@@ -244,7 +247,7 @@ def h2h_snapshot(
 
 
 def prepare_completed_matches(source: pd.DataFrame) -> pd.DataFrame:
-    """Keep only valid, completed rows eligible for a historical target."""
+    """Keep valid results and preserve weekly fallback when no timestamp exists."""
     required = {
         "tourney_date",
         "winner_name",
@@ -261,6 +264,16 @@ def prepare_completed_matches(source: pd.DataFrame) -> pd.DataFrame:
     prepared["match_date"] = pd.to_datetime(
         prepared["tourney_date"].astype("string"), format="%Y%m%d", errors="coerce"
     )
+    if "match_completed_at_utc" in prepared:
+        completed_at = pd.to_datetime(
+            prepared["match_completed_at_utc"], errors="coerce", utc=True
+        ).dt.tz_localize(None)
+    else:
+        completed_at = pd.Series(pd.NaT, index=prepared.index, dtype="datetime64[ns]")
+    # Standard provider rows retain their weekly timestamp. Only verified
+    # dashboard feedback has enough timing information to update same-event
+    # state for a later match.
+    prepared["feature_available_at"] = completed_at.fillna(prepared["match_date"])
     prepared["winner_key"] = prepared["winner_name"].map(normalized_player_key)
     prepared["loser_key"] = prepared["loser_name"].map(normalized_player_key)
     eligible = prepared.loc[
@@ -270,7 +283,7 @@ def prepare_completed_matches(source: pd.DataFrame) -> pd.DataFrame:
         & prepared["loser_key"].ne("")
         & prepared["winner_key"].ne(prepared["loser_key"])
     ].copy()
-    return eligible.sort_values(["match_date", "match_identity"], kind="stable")
+    return eligible.sort_values(["feature_available_at", "match_identity"], kind="stable")
 
 
 def feature_fields() -> list[str]:
@@ -295,10 +308,10 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
     )
     history_fields = feature_fields()
     records: list[dict[str, object]] = []
-    prior_week: pd.Timestamp | None = None
+    prior_available_at: pd.Timestamp | None = None
 
-    for match_date, week_matches in matches.groupby("match_date", sort=True):
-        for row in week_matches.itertuples(index=False):
+    for available_at, time_matches in matches.groupby("feature_available_at", sort=True):
+        for row in time_matches.itertuples(index=False):
             winner_key = row.winner_key
             loser_key = row.loser_key
             if winner_key < loser_key:
@@ -313,8 +326,8 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
                 player_a_won = 0
 
             surface = clean_category(row.surface)
-            player_a_history = players[player_a_key].snapshot(match_date, surface)
-            player_b_history = players[player_b_key].snapshot(match_date, surface)
+            player_a_history = players[player_a_key].snapshot(available_at, surface)
+            player_b_history = players[player_b_key].snapshot(available_at, surface)
             player_a_rank, player_a_rank_points = extract_entering_values(
                 row, player_a_side
             )
@@ -338,9 +351,18 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
             player_b_surface_elo = surface_elo[surface][player_b_key]
             record: dict[str, object] = {
                 "feature_version": FEATURE_VERSION,
-                "match_date": match_date.date().isoformat(),
+                "match_date": row.match_date.date().isoformat(),
+                "source_match_identity": str(row.match_identity),
+                "feature_available_at_utc": available_at.tz_localize("UTC").isoformat(),
                 "feature_cutoff_date": (
-                    prior_week.date().isoformat() if prior_week is not None else pd.NA
+                    prior_available_at.date().isoformat()
+                    if prior_available_at is not None
+                    else pd.NA
+                ),
+                "feature_cutoff_at_utc": (
+                    prior_available_at.tz_localize("UTC").isoformat()
+                    if prior_available_at is not None
+                    else pd.NA
                 ),
                 "tourney_name": clean_category(row.tourney_name),
                 "surface": surface,
@@ -384,7 +406,7 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
 
         overall_deltas: defaultdict[str, float] = defaultdict(float)
         surface_deltas: defaultdict[str, float] = defaultdict(float)
-        for row in week_matches.itertuples(index=False):
+        for row in time_matches.itertuples(index=False):
             surface = clean_category(row.surface)
             winner_rating = overall_elo[row.winner_key]
             loser_rating = overall_elo[row.loser_key]
@@ -405,16 +427,16 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
         for (surface, player_key), delta in surface_deltas.items():
             surface_elo[surface][player_key] += delta
 
-        for row in week_matches.itertuples(index=False):
+        for row in time_matches.itertuples(index=False):
             surface = clean_category(row.surface)
             players[row.winner_key].add_completed_match(
-                match_date=match_date,
+                match_date=available_at,
                 surface=surface,
                 won=True,
                 metrics=player_match_metrics(row, "w"),
             )
             players[row.loser_key].add_completed_match(
-                match_date=match_date,
+                match_date=available_at,
                 surface=surface,
                 won=False,
                 metrics=player_match_metrics(row, "l"),
@@ -422,7 +444,7 @@ def build_pre_match_features(source: pd.DataFrame) -> pd.DataFrame:
             matchup_key = tuple(sorted((row.winner_key, row.loser_key)))
             head_to_head[matchup_key][row.winner_key] += 1
             surface_head_to_head[(surface, *matchup_key)][row.winner_key] += 1
-        prior_week = match_date
+        prior_available_at = available_at
 
     features = pd.DataFrame.from_records(records)
     validate_feature_table(features)
@@ -433,7 +455,9 @@ def validate_feature_table(features: pd.DataFrame) -> None:
     """Fail loudly when generated features violate their temporal controls."""
     required = {
         "match_date",
+        "feature_available_at_utc",
         "feature_cutoff_date",
+        "feature_cutoff_at_utc",
         "player_a",
         "player_b",
         "target_player_a_won",
@@ -454,10 +478,12 @@ def validate_feature_table(features: pd.DataFrame) -> None:
         raise ValueError(f"Feature output contains leakage-prone columns: {forbidden}")
     if not features["target_player_a_won"].isin([0, 1]).all():
         raise ValueError("The target must contain only binary Player A outcomes.")
-    match_dates = pd.to_datetime(features["match_date"], errors="coerce")
-    cutoff_dates = pd.to_datetime(features["feature_cutoff_date"], errors="coerce")
-    if (cutoff_dates.notna() & cutoff_dates.ge(match_dates)).any():
-        raise ValueError("A row uses feature history from its own or a later week.")
+    available_at = pd.to_datetime(
+        features["feature_available_at_utc"], errors="coerce", utc=True
+    )
+    cutoff_at = pd.to_datetime(features["feature_cutoff_at_utc"], errors="coerce", utc=True)
+    if (cutoff_at.notna() & cutoff_at.ge(available_at)).any():
+        raise ValueError("A row uses feature history from its own or a later time.")
 
 
 def main() -> int:

@@ -6,13 +6,14 @@ Run from this project directory:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time, timezone
 from io import BytesIO
 import re
 import subprocess
 import unicodedata
 from typing import Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import plotly.express as px
@@ -32,6 +33,7 @@ from live_prediction_pipeline import (
     data_freshness,
     load_canonical_matches,
     predict_live_match,
+    record_completed_match_feedback,
     refresh_daily_data,
 )
 from step_02_load_and_compatre_providers import load_provider
@@ -2115,6 +2117,19 @@ def positive_or_none(value: float) -> float | None:
     return float(value) if value > 0 else None
 
 
+def local_match_time_to_utc(
+    match_day: date, match_time: time, timezone_name: str
+) -> str:
+    """Convert an event-local schedule time into an auditable UTC timestamp."""
+    try:
+        zone = ZoneInfo(timezone_name.strip())
+    except ZoneInfoNotFoundError as error:
+        raise ValueError(
+            "Use a valid IANA time zone, such as America/Los_Angeles or Europe/London."
+        ) from error
+    return datetime.combine(match_day, match_time, tzinfo=zone).astimezone(timezone.utc).isoformat()
+
+
 def direct_elimination_round_options(round_codes: list[str]) -> list[tuple[str, str]]:
     """Label a draw's rounds in the order in which players encounter them."""
     return [
@@ -2158,6 +2173,163 @@ def draw_data_refresh() -> None:
                 )
                 st.cache_data.clear()
                 st.rerun()
+
+
+def draw_completed_match_feedback(
+    *,
+    players: list[str],
+    tournament_week_start: date,
+    tournament_name: str,
+    tournament_category: str,
+    tourney_level: str,
+    surface: str,
+    round_name: str,
+    default_player_one: str,
+    default_player_two: str,
+    event_timezone: str,
+) -> None:
+    """Capture a verified result for later matches in any multi-day event."""
+    st.markdown("#### Record a completed match")
+    st.caption(
+        "Save a verified singles result once. It is append-only and can influence only a "
+        "later scheduled match in the same event; it never changes an earlier forecast."
+    )
+    with st.form("completed_match_feedback_form", border=True):
+        event_left, event_right, completion_left, completion_right = st.columns(4)
+        with event_left:
+            feedback_week_start = st.date_input(
+                "Tournament start date",
+                value=tournament_week_start,
+                key="feedback_tournament_week_start",
+            )
+        with event_right:
+            feedback_tournament_name = st.text_input(
+                "Tournament name",
+                value=tournament_name,
+                key="feedback_tournament_name",
+            )
+        with completion_left:
+            feedback_completion_date = st.date_input(
+                "Match completion date (local)",
+                value=date.today(),
+                key="feedback_completion_date",
+            )
+        with completion_right:
+            feedback_completion_time = st.time_input(
+                "Match completion time (local)",
+                value=time(15, 0),
+                key="feedback_completion_time",
+                help="Use the best known completed time. It decides which later matches may use this result.",
+            )
+        feedback_timezone = st.text_input(
+            "Event time zone",
+            value=event_timezone,
+            key="feedback_event_timezone",
+            help="IANA time zone, such as America/Los_Angeles. Stored results are converted to UTC.",
+        )
+        st.caption(
+            f"Event context: {tournament_category} · {surface} · {round_name}. "
+            "Change the tournament setup above before recording a result from another event."
+        )
+        feedback_player_one = st.selectbox(
+            "Player 1", players, index=players.index(default_player_one), key="feedback_player_one"
+        )
+        feedback_player_two_options = [player for player in players if player != feedback_player_one]
+        default_two_index = (
+            feedback_player_two_options.index(default_player_two)
+            if default_player_two in feedback_player_two_options
+            else 0
+        )
+        feedback_player_two = st.selectbox(
+            "Player 2",
+            feedback_player_two_options,
+            index=default_two_index,
+            key="feedback_player_two",
+        )
+        feedback_winner = st.selectbox(
+            "Winner", [feedback_player_one, feedback_player_two], key="feedback_winner"
+        )
+        feedback_score = st.text_input(
+            "Final score", placeholder="Example: 6-4 6-3", key="feedback_score"
+        )
+        st.caption(
+            "Optional but recommended: enter the official rankings and points that applied before this completed match."
+        )
+        rankings_left, rankings_right = st.columns(2)
+        with rankings_left:
+            feedback_rank_one = st.number_input(
+                f"{feedback_player_one} official rank before match",
+                min_value=0,
+                max_value=5_000,
+                value=0,
+                key=f"feedback_rank_one_{feedback_player_one}",
+            )
+            feedback_points_one = st.number_input(
+                f"{feedback_player_one} official ranking points before match",
+                min_value=0.0,
+                max_value=10_000_000.0,
+                value=0.0,
+                step=1.0,
+                key=f"feedback_points_one_{feedback_player_one}",
+            )
+        with rankings_right:
+            feedback_rank_two = st.number_input(
+                f"{feedback_player_two} official rank before match",
+                min_value=0,
+                max_value=5_000,
+                value=0,
+                key=f"feedback_rank_two_{feedback_player_two}",
+            )
+            feedback_points_two = st.number_input(
+                f"{feedback_player_two} official ranking points before match",
+                min_value=0.0,
+                max_value=10_000_000.0,
+                value=0.0,
+                step=1.0,
+                key=f"feedback_points_two_{feedback_player_two}",
+            )
+        save_feedback = st.form_submit_button("Save verified result", type="primary")
+
+    if not save_feedback:
+        return
+    try:
+        completed_at_utc = local_match_time_to_utc(
+            feedback_completion_date, feedback_completion_time, feedback_timezone
+        )
+        player_one_won = feedback_winner == feedback_player_one
+        saved = record_completed_match_feedback(
+            tournament_week_start=feedback_week_start,
+            tournament_name=feedback_tournament_name,
+            tourney_level=tourney_level,
+            surface=surface,
+            round_name=round_name,
+            winner_name=feedback_winner,
+            loser_name=feedback_player_two if player_one_won else feedback_player_one,
+            score=feedback_score,
+            match_completed_at_utc=completed_at_utc,
+            winner_rank=positive_or_none(
+                feedback_rank_one if player_one_won else feedback_rank_two
+            ),
+            loser_rank=positive_or_none(
+                feedback_rank_two if player_one_won else feedback_rank_one
+            ),
+            winner_rank_points=positive_or_none(
+                feedback_points_one if player_one_won else feedback_points_two
+            ),
+            loser_rank_points=positive_or_none(
+                feedback_points_two if player_one_won else feedback_points_one
+            ),
+        )
+    except ValueError as error:
+        st.error(f"Could not save feedback. {error}")
+    else:
+        if saved.added:
+            st.success(
+                "Verified result saved. A later match in this event will use it only when its "
+                "scheduled start is after the recorded completion time."
+            )
+        else:
+            st.info("That exact verified result is already in the feedback ledger.")
 
 
 def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
@@ -2290,6 +2462,15 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
                 "WTA tour levels can use different main-draw sizes. The bracket selection above "
                 "keeps the stage list accurate for the chosen event."
             )
+        default_tournament_name = (
+            "WTA Finals" if tournament_category == "WTA Finals" else f"{tournament_category} event"
+        )
+        tournament_name = st.text_input(
+            "Tournament name",
+            value=default_tournament_name,
+            key="live_tournament_name",
+            help="Use the same published event name when recording completed-match feedback.",
+        )
 
     st.markdown("#### Player comparison")
     st.caption("Select either player first; probability is shown in the same left-to-right order.")
@@ -2309,13 +2490,20 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
     with st.form("live_prediction_form", border=False):
         with st.container(border=True):
             st.markdown("#### Match timing")
-            date_column, cutoff_column = st.columns(2)
+            date_column, time_column, cutoff_column = st.columns(3)
             with date_column:
                 match_date = st.date_input(
                     "Match date",
                     value=date.today(),
                     key="live_match_date",
-                    help="Shown in the forecast record; it does not change the feature cutoff.",
+                    help="Used with the scheduled start time to decide which verified event results are available.",
+                )
+            with time_column:
+                match_time = st.time_input(
+                    "Scheduled match start time (local)",
+                    value=time(12, 0),
+                    key="live_match_time",
+                    help="A verified result can be used only if it finished before this time.",
                 )
             with cutoff_column:
                 tournament_week_start = st.date_input(
@@ -2327,6 +2515,12 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
                     ),
                     key="live_tournament_week_start",
                 )
+            event_timezone = st.text_input(
+                "Event time zone",
+                value="America/Los_Angeles",
+                key="live_event_timezone",
+                help="IANA time zone, such as America/Los_Angeles. Schedule and feedback times are stored as UTC.",
+            )
 
         with st.container(border=True):
             st.markdown("#### Official WTA ranking context")
@@ -2389,11 +2583,16 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
         manual_points_two = positive_or_none(entered_points_two)
         with st.spinner("Building a cutoff-safe feature row and fitting the live model…"):
             try:
+                match_start_utc = local_match_time_to_utc(
+                    match_date, match_time, event_timezone
+                )
                 prediction = predict_live_match(
                     source,
                     player_one=player_one,
                     player_two=player_two,
                     tournament_week_start=tournament_week_start,
+                    tournament_name=tournament_name,
+                    match_start_utc=match_start_utc,
                     surface=selected_surface,
                     tourney_level=tourney_level,
                     round_name=selected_round,
@@ -2462,7 +2661,14 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
                     )
                     st.write(
                         f"Selected tournament week: {prediction['tournament_week_start']} · "
-                        f"displayed match date: {match_date}."
+                        f"scheduled match start: {prediction['match_start_utc']}."
+                    )
+                    st.write(
+                        "Same-event feedback used: "
+                        f"{prediction['same_event_feedback_result_count']:,} verified completed result(s) "
+                        "before this match start; "
+                        f"{prediction['same_event_feedback_training_rows']:,} were added to this "
+                        "temporary live training run."
                     )
                     st.write(
                         "Ranking provenance: only values entered in this forecast form were used. "
@@ -2483,15 +2689,29 @@ def draw_live_predictions(raw_data_version: tuple[int, int, int]) -> None:
                         "and changes in competition are not included."
                     )
 
+    draw_completed_match_feedback(
+        players=players,
+        tournament_week_start=tournament_week_start,
+        tournament_name=tournament_name,
+        tournament_category=tournament_category,
+        tourney_level=tourney_level,
+        surface=selected_surface,
+        round_name=selected_round,
+        default_player_one=player_one,
+        default_player_two=player_two,
+        event_timezone=event_timezone,
+    )
+
     with st.expander("Pre-match safeguards"):
         st.write(
             "Round-robin group play is not a knockout bracket: a loss does not remove a "
             "player from later matchup selection, and this dashboard never infers elimination."
         )
         st.write(
-            "Source records are dated to a tournament week rather than a reliable match day. "
-            "Results from the selected week are excluded from every prediction in that week, "
-            "even after a daily refresh."
+            "Provider records are dated to a tournament week rather than a reliable match day, "
+            "so they remain excluded from other matches in that week. The only exception is a "
+            "verified dashboard feedback record with an exact completion time before the selected "
+            "upcoming match start."
         )
 
 

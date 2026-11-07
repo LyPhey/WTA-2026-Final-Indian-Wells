@@ -23,6 +23,7 @@ from statistics import NormalDist
 import subprocess
 import sys
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,7 @@ FEATURES_PATH = PROJECT_DIR / "data/processed/wta_pre_match_features.csv"
 CURRENT_TML_PATH = PROJECT_DIR / "data/raw/tennismylife/2026_wta.csv"
 TML_RAW_DIR = CURRENT_TML_PATH.parent
 DOWNLOAD_MANIFEST_PATH = PROJECT_DIR / "data/raw/download_manifest.csv"
+FEEDBACK_RESULTS_PATH = PROJECT_DIR / "data/live_feedback/verified_completed_matches.csv"
 SNAPSHOT_ROOT = PROJECT_DIR / "data/snapshots/daily_refresh"
 HISTORY_START_YEAR = 2016
 HISTORY_END_YEAR = 2026
@@ -51,6 +53,27 @@ LIVE_CALIBRATION_NEIGHBOR_COUNT = 400
 PREDICTION_TOURNAMENT_NAME = "Live WTA Finals prediction"
 TUNING_REPORTS_DIR = PROJECT_DIR / "reports/hyperparameter_tuning"
 MODEL_COMPARISON_PATH = TUNING_REPORTS_DIR / "nested_walk_forward_model_comparison.csv"
+FEEDBACK_COLUMNS = [
+    "feedback_id",
+    "recorded_at_utc",
+    "feedback_match_key",
+    "tourney_date",
+    "tourney_name",
+    "tourney_level",
+    "surface",
+    "round",
+    "winner_name",
+    "loser_name",
+    "score",
+    "winner_rank",
+    "loser_rank",
+    "winner_rank_points",
+    "loser_rank_points",
+    "match_completed_at_utc",
+    "match_status",
+    "match_identity",
+    "feedback_status",
+]
 
 
 @dataclass(frozen=True)
@@ -62,6 +85,15 @@ class DailyRefreshResult:
     appended_rows: int
     merged_files: int
     command_logs: dict[str, str]
+
+
+@dataclass(frozen=True)
+class FeedbackRecordResult:
+    """A verified, append-only result submitted from the dashboard."""
+
+    feedback_id: str
+    added: bool
+    recorded_at_utc: str
 
 
 def _command_output(command: list[str], label: str) -> str:
@@ -247,6 +279,217 @@ def load_canonical_matches(path: Path = CANONICAL_MATCHES_PATH) -> pd.DataFrame:
     return source
 
 
+def _as_utc_naive_timestamp(value: object, label: str) -> pd.Timestamp:
+    """Validate an exact timestamp and return a timezone-free UTC value."""
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp) or timestamp.tzinfo is None:
+        raise ValueError(f"{label} must include a valid time zone.")
+    return timestamp.tz_convert("UTC").tz_localize(None)
+
+
+def _feedback_match_key(
+    *,
+    tournament_week_start: object,
+    tournament_name: str,
+    round_name: str,
+    player_one: str,
+    player_two: str,
+) -> str:
+    """Identify one scheduled singles match without depending on its winner."""
+    week_start = pd.Timestamp(tournament_week_start).normalize()
+    player_keys = sorted((normalized_player_key(player_one), normalized_player_key(player_two)))
+    if pd.isna(week_start) or not all(player_keys):
+        raise ValueError("Tournament week and both player names are required.")
+    return " | ".join(
+        [
+            week_start.date().isoformat(),
+            normalized_player_key(tournament_name),
+            str(round_name).strip().upper(),
+            *player_keys,
+        ]
+    )
+
+
+def _optional_positive_number(value: object) -> float:
+    """Keep valid entered rankings while preserving missing values as NaN."""
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(number) if pd.notna(number) and number > 0 else np.nan
+
+
+def record_completed_match_feedback(
+    *,
+    tournament_week_start: object,
+    tournament_name: str,
+    tourney_level: str,
+    surface: str,
+    round_name: str,
+    winner_name: str,
+    loser_name: str,
+    score: str,
+    match_completed_at_utc: object,
+    winner_rank: float | None = None,
+    loser_rank: float | None = None,
+    winner_rank_points: float | None = None,
+    loser_rank_points: float | None = None,
+    feedback_path: Path = FEEDBACK_RESULTS_PATH,
+) -> FeedbackRecordResult:
+    """Append one confirmed result without overwriting the feedback ledger.
+
+    This ledger is deliberately separate from downloaded provider files. It is
+    available to a later, timestamped live forecast in the same event, but a
+    duplicate or conflicting entry for the same scheduled match is rejected.
+    """
+    week_start = pd.Timestamp(tournament_week_start).normalize()
+    completed_at = _as_utc_naive_timestamp(
+        match_completed_at_utc, "Match completion time"
+    )
+    tournament_name = str(tournament_name).strip()
+    round_name = str(round_name).strip().upper()
+    surface = str(surface).strip()
+    tourney_level = str(tourney_level).strip()
+    winner_name = str(winner_name).strip()
+    loser_name = str(loser_name).strip()
+    score = str(score).strip()
+    if pd.isna(week_start) or not tournament_name or not round_name or not surface or not tourney_level:
+        raise ValueError("Tournament week, name, level, surface, and round are required.")
+    if not winner_name or not loser_name or normalized_player_key(winner_name) == normalized_player_key(loser_name):
+        raise ValueError("Enter two distinct players and select the actual winner.")
+    if not score:
+        raise ValueError("Enter the completed match score before saving feedback.")
+    if completed_at < week_start:
+        raise ValueError("Match completion cannot be before the tournament week starts.")
+
+    match_key = _feedback_match_key(
+        tournament_week_start=week_start,
+        tournament_name=tournament_name,
+        round_name=round_name,
+        player_one=winner_name,
+        player_two=loser_name,
+    )
+    feedback_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = (
+        pd.read_csv(feedback_path, low_memory=False)
+        if feedback_path.is_file()
+        else pd.DataFrame(columns=FEEDBACK_COLUMNS)
+    )
+    if "feedback_match_key" in existing:
+        conflicts = existing.loc[existing["feedback_match_key"].eq(match_key)]
+    else:
+        conflicts = pd.DataFrame()
+    if not conflicts.empty:
+        prior = conflicts.iloc[0]
+        same_result = (
+            str(prior.get("winner_name", "")).strip() == winner_name
+            and str(prior.get("loser_name", "")).strip() == loser_name
+            and str(prior.get("score", "")).strip() == score
+            and str(prior.get("match_completed_at_utc", "")).strip()
+            == completed_at.tz_localize("UTC").isoformat()
+        )
+        if same_result:
+            return FeedbackRecordResult(
+                feedback_id=str(prior["feedback_id"]),
+                added=False,
+                recorded_at_utc=str(prior["recorded_at_utc"]),
+            )
+        raise ValueError(
+            "A different verified feedback record already exists for this match. "
+            "The append-only ledger will not overwrite it."
+        )
+
+    recorded_at = pd.Timestamp.now(tz="UTC")
+    feedback_id = f"feedback_{uuid4().hex}"
+    record = {
+        "feedback_id": feedback_id,
+        "recorded_at_utc": recorded_at.isoformat(),
+        "feedback_match_key": match_key,
+        "tourney_date": week_start.strftime("%Y%m%d"),
+        "tourney_name": tournament_name,
+        "tourney_level": tourney_level,
+        "surface": surface,
+        "round": round_name,
+        "winner_name": winner_name,
+        "loser_name": loser_name,
+        "score": score,
+        "winner_rank": _optional_positive_number(winner_rank),
+        "loser_rank": _optional_positive_number(loser_rank),
+        "winner_rank_points": _optional_positive_number(winner_rank_points),
+        "loser_rank_points": _optional_positive_number(loser_rank_points),
+        "match_completed_at_utc": completed_at.tz_localize("UTC").isoformat(),
+        "match_status": "Completed",
+        "match_identity": feedback_id,
+        "feedback_status": "verified",
+    }
+    merged = pd.concat(
+        [existing.reindex(columns=FEEDBACK_COLUMNS), pd.DataFrame([record], columns=FEEDBACK_COLUMNS)],
+        ignore_index=True,
+    )
+    temporary_path = feedback_path.with_suffix(feedback_path.suffix + ".tmp")
+    merged.to_csv(temporary_path, index=False)
+    temporary_path.replace(feedback_path)
+    return FeedbackRecordResult(
+        feedback_id=feedback_id, added=True, recorded_at_utc=recorded_at.isoformat()
+    )
+
+
+def load_verified_feedback(source: pd.DataFrame, feedback_path: Path = FEEDBACK_RESULTS_PATH) -> pd.DataFrame:
+    """Add verified feedback rows to a canonical source without changing it on disk."""
+    if not feedback_path.is_file():
+        return source.copy()
+    feedback = pd.read_csv(feedback_path, low_memory=False)
+    required = set(FEEDBACK_COLUMNS)
+    missing = sorted(required - set(feedback.columns))
+    if missing:
+        raise ValueError(f"Feedback ledger is missing required columns: {missing}")
+    feedback = feedback.loc[feedback["feedback_status"].eq("verified")].copy()
+    if feedback.empty:
+        return source.copy()
+    all_columns = list(dict.fromkeys([*source.columns, *feedback.columns]))
+    return pd.concat(
+        [source.reindex(columns=all_columns), feedback.reindex(columns=all_columns)],
+        ignore_index=True,
+        sort=False,
+    )
+
+
+def _source_available_before_match(
+    source: pd.DataFrame,
+    *,
+    tournament_week_start: object,
+    tournament_name: str,
+    match_start_utc: object,
+) -> tuple[pd.DataFrame, set[str]]:
+    """Return prior-week history plus earlier verified results from this event only."""
+    week_start = pd.Timestamp(tournament_week_start).normalize()
+    match_start = _as_utc_naive_timestamp(match_start_utc, "Upcoming match start time")
+    if pd.isna(week_start) or match_start < week_start:
+        raise ValueError("Upcoming match start must be on or after the tournament week start.")
+    prepared = source.copy()
+    prepared["_week_start"] = pd.to_datetime(
+        prepared["tourney_date"].astype("string"), format="%Y%m%d", errors="coerce"
+    )
+    base_history = prepared.loc[prepared["_week_start"].lt(week_start)].copy()
+    completion_values = (
+        prepared["match_completed_at_utc"]
+        if "match_completed_at_utc" in prepared
+        else pd.Series(pd.NaT, index=prepared.index, dtype="datetime64[ns]")
+    )
+    feedback_time = pd.to_datetime(
+        completion_values, errors="coerce", utc=True
+    ).dt.tz_localize(None)
+    feedback_event = (
+        prepared.get("feedback_status", pd.Series(index=prepared.index, dtype="object"))
+        .eq("verified")
+        & prepared["_week_start"].eq(week_start)
+        & prepared["tourney_name"].map(normalized_player_key).eq(normalized_player_key(tournament_name))
+        & feedback_time.lt(match_start)
+    )
+    event_feedback = prepared.loc[feedback_event].copy()
+    feedback_ids = set(event_feedback["match_identity"].astype(str))
+    selected = pd.concat([base_history, event_feedback], ignore_index=True, sort=False)
+    selected = selected.drop(columns="_week_start")
+    return selected, feedback_ids
+
+
 def available_players(source: pd.DataFrame) -> list[str]:
     """Return the sorted player names that can be selected in the dashboard."""
     names = set(source["winner_name"].dropna().astype(str)) | set(
@@ -306,6 +549,8 @@ def _build_prediction_feature_row(
     player_one: str,
     player_two: str,
     tournament_week_start: object,
+    tournament_name: str,
+    match_start_utc: object,
     surface: str,
     tourney_level: str,
     round_name: str,
@@ -313,7 +558,7 @@ def _build_prediction_feature_row(
     player_two_rank: float | None,
     player_one_rank_points: float | None,
     player_two_rank_points: float | None,
-) -> tuple[pd.DataFrame, str, str]:
+) -> tuple[pd.DataFrame, str, str, pd.DataFrame, int]:
     """Use the established step-05 builder to make one synthetic pre-match row.
 
     The synthetic row is never written to disk.  Its arbitrary winner label is
@@ -327,6 +572,13 @@ def _build_prediction_feature_row(
     cutoff = pd.Timestamp(tournament_week_start).normalize()
     if pd.isna(cutoff):
         raise ValueError("Tournament-week start must be a valid date.")
+    selected_source, feedback_ids = _source_available_before_match(
+        source,
+        tournament_week_start=cutoff,
+        tournament_name=tournament_name,
+        match_start_utc=match_start_utc,
+    )
+    match_start = _as_utc_naive_timestamp(match_start_utc, "Upcoming match start time")
     if first_key < second_key:
         player_a, player_b = player_one, player_two
         rank_a, rank_b = player_one_rank, player_two_rank
@@ -336,7 +588,10 @@ def _build_prediction_feature_row(
         rank_a, rank_b = player_two_rank, player_one_rank
         points_a, points_b = player_two_rank_points, player_one_rank_points
 
-    synthetic = {column: np.nan for column in source.columns}
+    prediction_identity = (
+        f"LIVE_PREDICTION | {match_start.tz_localize('UTC').isoformat()} | {first_key} | {second_key}"
+    )
+    synthetic = {column: np.nan for column in selected_source.columns}
     synthetic.update(
         {
             "tourney_date": cutoff.strftime("%Y%m%d"),
@@ -351,25 +606,35 @@ def _build_prediction_feature_row(
             "winner_rank_points": points_a,
             "loser_rank_points": points_b,
             "match_status": "Completed",
-            "match_identity": (
-                f"LIVE_PREDICTION | {cutoff.date().isoformat()} | {first_key} | {second_key}"
-            ),
+            "match_identity": prediction_identity,
+            "match_completed_at_utc": match_start.tz_localize("UTC").isoformat(),
         }
     )
-    augmented = pd.concat([source, pd.DataFrame([synthetic])], ignore_index=True, sort=False)
+    augmented = pd.concat(
+        [selected_source, pd.DataFrame([synthetic])], ignore_index=True, sort=False
+    )
     features = build_pre_match_features(augmented)
     prediction = features.loc[
-        features["tourney_name"].eq(PREDICTION_TOURNAMENT_NAME)
-        & features["match_date"].eq(cutoff.date().isoformat())
+        features["source_match_identity"].eq(prediction_identity)
     ]
     if len(prediction) != 1:
         raise RuntimeError("Could not create exactly one live pre-match feature row.")
-    return prediction[MODEL_FEATURES], player_a, player_b
+    feedback_training_rows = features.loc[
+        features["source_match_identity"].isin(feedback_ids)
+    ].copy()
+    return (
+        prediction[MODEL_FEATURES],
+        player_a,
+        player_b,
+        feedback_training_rows,
+        int(len(feedback_training_rows)),
+    )
 
 
 def _fit_live_model(
     feature_path: Path,
     tournament_week_start: object,
+    feedback_training_rows: pd.DataFrame | None = None,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit the best backtested candidate only through the safe cutoff."""
     if not feature_path.is_file():
@@ -382,6 +647,10 @@ def _fit_live_model(
     training = features.loc[
         features["match_date"].between(training_start, cutoff - pd.Timedelta(days=1))
     ].copy()
+    historical_training_rows = int(len(training))
+    if feedback_training_rows is not None and not feedback_training_rows.empty:
+        feedback_training_rows = validate_input(feedback_training_rows)
+        training = pd.concat([training, feedback_training_rows], ignore_index=True, sort=False)
     if training.empty:
         raise ValueError("No historical feature rows are available before this tournament week.")
     if training[TARGET_COLUMN].nunique() != 2:
@@ -391,6 +660,8 @@ def _fit_live_model(
     pipeline.fit(training[MODEL_FEATURES], training[TARGET_COLUMN])
     return pipeline, {
         "training_rows": int(len(training)),
+        "historical_training_rows": historical_training_rows,
+        "same_event_feedback_training_rows": int(len(training) - historical_training_rows),
         "training_start_date": training["match_date"].min().date().isoformat(),
         "training_end_date": training["match_date"].max().date().isoformat(),
         "feature_version": training["feature_version"].iloc[0],
@@ -505,6 +776,8 @@ def predict_live_match(
     player_one: str,
     player_two: str,
     tournament_week_start: object,
+    tournament_name: str,
+    match_start_utc: object,
     surface: str,
     tourney_level: str,
     round_name: str,
@@ -513,13 +786,23 @@ def predict_live_match(
     player_one_rank_points: float | None,
     player_two_rank_points: float | None,
     feature_path: Path = FEATURES_PATH,
+    feedback_path: Path = FEEDBACK_RESULTS_PATH,
 ) -> dict[str, Any]:
     """Return complementary win probabilities for one known upcoming matchup."""
-    feature_row, player_a, player_b = _build_prediction_feature_row(
-        source,
+    source_with_feedback = load_verified_feedback(source, feedback_path)
+    (
+        feature_row,
+        player_a,
+        player_b,
+        feedback_training_rows,
+        feedback_result_count,
+    ) = _build_prediction_feature_row(
+        source_with_feedback,
         player_one=player_one,
         player_two=player_two,
         tournament_week_start=tournament_week_start,
+        tournament_name=tournament_name,
+        match_start_utc=match_start_utc,
         surface=surface,
         tourney_level=tourney_level,
         round_name=round_name,
@@ -529,7 +812,7 @@ def predict_live_match(
         player_two_rank_points=player_two_rank_points,
     )
     pipeline, training_metadata = _fit_live_model(
-        feature_path, tournament_week_start
+        feature_path, tournament_week_start, feedback_training_rows
     )
     probability_a = float(pipeline.predict_proba(feature_row)[0, 1])
     lower_a, upper_a, interval_metadata = _calibrated_probability_interval(
@@ -556,6 +839,11 @@ def predict_live_match(
         "internal_player_a": player_a,
         "internal_player_b": player_b,
         "tournament_week_start": pd.Timestamp(tournament_week_start).date().isoformat(),
+        "tournament_name": tournament_name,
+        "match_start_utc": _as_utc_naive_timestamp(
+            match_start_utc, "Upcoming match start time"
+        ).tz_localize("UTC").isoformat(),
+        "same_event_feedback_result_count": feedback_result_count,
         "surface": surface,
         "tourney_level": tourney_level,
         "round": round_name,
